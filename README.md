@@ -7,6 +7,22 @@ Windows 桌面程序：`customtkinter` 图形界面 + Selenium 课程学习内�
 > 不得用于 24 小时高强度挂机或替他人刷课。平台风控日益严格，已有账号被封禁的案例；
 > 因使用本程序导致的账号、成绩或法律风险由使用者自行承担。详见 [LICENSE](LICENSE)。
 
+## 致谢
+
+本仓库是**深度定制分支**，原始项目与核心能力来自
+**[Mortal004/Xuexitong_shuake](https://github.com/Mortal004/Xuexitong_shuake)**
+（作者 **Mortal004**，基线 `26.10.13`；`Copyright (c) 2025 Mortal004`，**仅限非商业使用**）。
+题库与 AI 答题的整体思路、各类任务点的处理框架、人脸识别、签到协议、界面骨架等均源自原作者；
+本分支只在其上做稳定性、可观测性、多账号隔离、考试安全与界面方面的长期改进，
+所有改进都以原项目的许可证与使用约定为前提。
+
+另参考了 [ocsjs/ocsjs](https://github.com/ocsjs/ocsjs)（MIT）与
+[fysh1010/chaoxing-script](https://github.com/fysh1010/chaoxing-script)（MIT）的算法思路，
+未复制代码；[pang-qin/chaoxing-toolkit](https://github.com/pang-qin/chaoxing-toolkit)
+未声明许可证，仅阅读参考。
+
+完整说明见 [CHANGELOG.md](CHANGELOG.md) 的「关于这个项目与原作者」一节。
+
 ## 与上游的关系
 
 | | 上游 master 源码 | 本仓库 |
@@ -27,12 +43,14 @@ Windows 桌面程序：`customtkinter` 图形界面 + Selenium 课程学习内�
 
 ## 主要功能
 
-- 自动完成视频 / PPT / 音频 / 阅读 / 讨论 / 直播 / 作业 / 章节测验
-- 答题优先查免费题库，DeepSeek AI 兜底；图片题走多模态；特殊题与简答题有频率限流
-- 自动签到（普通签到 / 位置签到），30 秒基础间隔 + 空闲退避 + 4 小时自动停止
+- 自动完成视频 / PPT / 音频 / 阅读 / 讨论 / 直播 / 作业 / 章节测验 / 问卷
+- 考试：按课程循环作答，或使用独立的「开始考试」入口（只读识别页面、**绝不代点「进入考试」、绝不交卷**）
+- 复习模式：只对「看 / 听」类任务点重刷，测验 / 作业 / 考试绝不重做
+- 答题优先查免费题库（多源并发），任意 OpenAI 兼容接口兜底；图片题走多模态；有频率限流
+- 自动签到（仅普通签到 / 位置签到），30 秒基础间隔 + 空闲退避 + 4 小时自动停止
 - 多账号并发，每个账号独立子进程与独立数据目录
 - 7 套主题皮肤、定时刷课、课程进度查看
-- 主日志记录完整时间线；界面「⇩ 导出完整日志」一键导出单日 zip（自动脱敏）
+- 主日志 + 单账号明细 + 页面 DOM 快照；「⇩ 导出完整日志」一键导出单日 zip（自动脱敏）
 
 ## 环境要求
 
@@ -70,6 +88,8 @@ python -m PyInstaller start.spec --clean --noconfirm
 
 ## 测试
 
+当前规模：**79 个 `test_*.py`**（76 个纯桩套件 + 3 个需真实 Edge）与 **4 个真实浏览器冒烟脚本**。
+
 ```powershell
 python tests\run_stub_tests.py
 ```
@@ -77,6 +97,9 @@ python tests\run_stub_tests.py
 `run_stub_tests.py` 跑全部纯桩套件（不联网、不开浏览器）。
 `test_image_answer.py` / `test_quiz_image.py` / `test_quiz_selector.py` 需要真实 Edge 与匹配驱动，
 默认跳过；本机驱动版本不匹配时它们会报 `unhandled request`，属环境问题。
+
+`smoke_login_live.py` / `smoke_next_page_live.py` / `smoke_text_chapter_live.py` 会**真的启动 Edge**，
+用本地 HTTP 复刻真实页面结构做端到端验证，跑之前请确认不会影响正在运行的学习任务。
 
 ## 目录结构
 
