@@ -89,14 +89,28 @@ window.PCount = {
 </body></html>
 """
 
-# 章节内有 3 个卡片标签（截图里那种「1 正文 / 2 视频 / 3 ppt」）
+# 章节内有 3 个卡片标签（真实结构：dct1 正文 / dct2 视频 / dct3 ppt）
 MULTI_CARD_PAGE = TEXT_PAGE.replace(
     """    </li>
   </ul>""",
     """    </li>
-    <li title="视频" cardid="1209675774" id="dct2"><div class="prev_white"><span class="num">2</span><span class="spanText">视频</span></div></li>
-    <li title="ppt" cardid="1209675775" id="dct3"><div class="prev_white"><span class="num">3</span><span class="spanText">ppt</span></div></li>
-  </ul>""")
+    <li title="视频" cardid="1209675774" id="dct2"
+        onclick="changeDisplayContent(2,3,'1211178694','265852000','155480978','');"><div class="prev_white"><span class="num">2</span><span class="spanText">视频</span></div></li>
+    <li title="ppt" cardid="1209675775" id="dct3"
+        onclick="changeDisplayContent(3,3,'1211178694','265852000','155480978','');"><div class="prev_white"><span class="num">3</span><span class="spanText">ppt</span></div></li>
+  </ul>""").replace(
+    "window.PCount = {",
+    """window.changeDisplayContent = function(num, total){
+      var lis = document.querySelectorAll('.prev_ul > li');
+      for (var i = 0; i < lis.length; i++) {
+        var n = parseInt(String(lis[i].id || '').replace('dct',''), 10);
+        lis[i].className = (n === num) ? 'active' : ('c' + n);
+      }
+      var f = document.getElementById('iframe');
+      if (f) { f.src = 'cards.html?num=' + (num - 1); }
+      window.__cardNum = num;
+    };
+window.PCount = {""")
 
 # 卡片帧里带真任务点（视频）
 VIDEO_CARDS = """<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
@@ -141,6 +155,8 @@ class QuietHandler(SimpleHTTPRequestHandler):
         # 这一刻页面看起来「什么都没有」，绝不能被判成纯文本。
         if self.path.startswith('/slow'):
             time.sleep(1.8)
+        if '?' in self.path:
+            self.path = self.path.split('?')[0]
         return super().do_GET()
 
     def handle_one_request(self):
@@ -236,7 +252,29 @@ def main():
         check('卡片未渲染时 page_message 返回空（等待重试）',
               core.page_message(driver) == {}, core.page_message(driver))
 
-        # 8) 没有「下一节」元素时不能崩
+        # 8) 多卡片章节：必须逐张切换，不能只处理当前激活的那一张
+        driver.get(root + 'multi.html')
+        time.sleep(1.2)
+        core._CARD_SEEN.clear()
+        core._CARD_TRIES.clear()
+        seq = []
+        for _ in range(4):
+            if not core._advance_card(driver, 'ch1'):
+                break
+            seq.append(driver.execute_script('return window.__cardNum'))
+        check('多卡片章节按顺序切到第 2、3 张', seq == [2, 3], seq)
+        check('全部卡片处理完后返回 False（可以翻页）',
+              core._advance_card(driver, 'ch1') is False)
+
+        # 单卡片章节不应该被「切卡片」逻辑拦住
+        driver.get(root + 'text.html')
+        time.sleep(1.0)
+        core._CARD_SEEN.clear()
+        core._CARD_TRIES.clear()
+        check('单卡片章节直接返回 False（正常翻页）',
+              core._advance_card(driver, 'single') is False)
+
+        # 9) 没有「下一节」元素时不能崩
         driver.get(root + 'cards.html')
         time.sleep(0.6)
         ok_none, why = core._force_next_chapter(driver)

@@ -617,13 +617,24 @@ class Start:
     def delete_huancun(self):
         try:
             folder_path = paths.record()
-            tiku_files = [f for f in os.listdir(folder_path)
-                          if f.endswith('.pkl') and os.path.isfile(os.path.join(folder_path, f))]
-            for tiku_file in tiku_files:
-                os.remove(os.path.join(folder_path, tiku_file))
-            tk.messagebox.showinfo('提示', '缓存记录文件已成功删除')
-        except:
-            tk.messagebox.showwarning('警告', '删除失败')
+            # 同时清 `cache_*.json`（2026-11-19 起的新格式）、`cache_*.pkl`（旧格式）
+            # 与迁移时留下的 `*.pkl.prejson` 备份。
+            # 旧实现只删 `.pkl`，新缓存删不掉，界面却提示"已成功删除"。
+            removed = 0
+            for name in os.listdir(folder_path):
+                stem, ext = os.path.splitext(name)
+                if not stem.startswith('cache_'):
+                    continue
+                if ext not in ('.json', '.pkl', '.prejson'):
+                    continue
+                path = os.path.join(folder_path, name)
+                if not os.path.isfile(path):
+                    continue
+                os.remove(path)
+                removed += 1
+            tk.messagebox.showinfo('提示', '缓存记录文件已成功删除（%d 个）' % removed)
+        except Exception as e:
+            tk.messagebox.showwarning('警告', '删除失败：%s' % type(e).__name__)
         self.show_question_bank()
 
     # ========== 更新检查（委托） ==========
@@ -721,19 +732,25 @@ class Start:
         self.tiku_text.configure(state=tk.NORMAL)
         self.tiku_text.delete('1.0', tk.END)
         try:
+            from core import safe_pickle
             folder_path = paths.record()
-            tiku_files = [f for f in os.listdir(folder_path)
-                          if f.endswith('.pkl') and os.path.isfile(os.path.join(folder_path, f))]
+            # 题库缓存从 2026-11-19 起改存 `cache_*.json`（旧版本是 `cache_*.pkl`）。
+            # 旧实现只列 `.pkl`，于是新缓存一个都看不到 —— 这一页永远显示"暂无缓存"，
+            # 用户以为缓存没生效（2026-11-22 核对 ai_wen_da.py:59 写的确实是 .json）。
+            stems = set()
+            for name in os.listdir(folder_path):
+                stem, ext = os.path.splitext(name)
+                if stem.startswith('cache_') and ext in ('.json', '.pkl'):
+                    stems.add(stem)
             tiku_txt = ''
-            for tiku_file in tiku_files:
-                if 'ques1' not in tiku_file:
+            for stem in sorted(stems):
+                if 'ques1' not in stem:
                     continue
-                tiku_file_path = os.path.join(folder_path, tiku_file)
-                # 任务06：题库缓存用受限反序列化，绝不普通 load 来源不明的 pkl
+                # 统一走 safe_pickle：新 JSON 优先，旧 pickle 受限反序列化并迁移
                 try:
-                    from core import safe_pickle
-                    cache = safe_pickle.safe_load_path(tiku_file_path, {})
-                    data = cache.get('value') if isinstance(cache, dict) else None
+                    data, _src = safe_pickle.load_json_or_pickle(
+                        os.path.join(folder_path, stem + '.json'),
+                        os.path.join(folder_path, stem + '.pkl'))
                 except Exception:
                     data = None
                 if not isinstance(data, dict):

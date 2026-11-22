@@ -1986,6 +1986,140 @@ def _force_next_chapter(driver):
     return False, str(info.get('why') or '未成功')
 
 
+# 章节内的卡片标签（「1 正文 / 2 视频 / 3 ppt」）。
+#
+# 真机 DOM（2026-11-22 用户快照 `002436_未识别页面_1` / `002446_视频`）：
+#   <ul class="prev_ul">
+#     <li id="dct1" class="active" title="第二节 华夏共同体的发展"
+#         onclick="changeDisplayContent(1,3,'1211178694','265852000','155480978','')">
+#     <li id="dct2" title="视频"
+#         onclick="changeDisplayContent(2,3,'1211178694','265852000','155480978','')">
+#     <li id="dct3" title="ppt"
+#         onclick="changeDisplayContent(3,3,'1211178694','265852000','155480978','')">
+#   </ul>
+#
+# 点哪个 li，就把 `#iframe` 的 src 换成对应的 `num`（dct1→num=0、dct2→num=1）。
+# **进入章节时永远默认激活 dct1（正文）**，视频/ppt 在别的卡片里 ——
+# 只处理当前激活的卡片，就会把整章的视频和 ppt 全部跳过。
+_CARDS_JS = r"""
+return (function(){
+  var out = {chapter: '', total: 0, items: []};
+  try {
+    var m = String(location.href || '').match(/chapterId=(\d+)/i);
+    out.chapter = m ? m[1] : '';
+  } catch(e) {}
+  var lis = [];
+  try { lis = document.querySelectorAll('.prev_ul > li[id^="dct"]'); } catch(e) {}
+  for (var i = 0; i < lis.length; i++) {
+    var li = lis[i];
+    var cls = li.className || '';
+    if (cls && typeof cls === 'object' && 'baseVal' in cls) cls = cls.baseVal;
+    out.items.push({
+      idx: parseInt(String(li.id || '').replace('dct', ''), 10) || 0,
+      title: String(li.getAttribute('title') || '').slice(0, 24),
+      active: /(^|\s)active(\s|$)/.test(String(cls))
+    });
+  }
+  out.total = lis.length;
+  return out;
+})();
+"""
+
+_SWITCH_CARD_JS = r"""
+return (function(idx){
+  var li = document.querySelector('#dct' + idx);
+  if (!li) {
+    var all = document.querySelectorAll('.prev_ul > li[id^="dct"]');
+    for (var i = 0; i < all.length; i++) {
+      if (String((all[i].id || '')).replace('dct', '') === String(idx)) { li = all[i]; break; }
+    }
+  }
+  if (!li) return {ok: 0, why: '没有第 ' + idx + ' 个卡片'};
+  var code = li.getAttribute('onclick') || '';
+  try {
+    // 直接执行平台自己的 changeDisplayContent(...)：换 src 是同步的，
+    // 点击反而可能被标签栏的遮罩/圆角命中层挡住。
+    if (code) { (new Function(code))(); return {ok: 1, how: 'onclick'}; }
+    li.click();
+    return {ok: 1, how: 'click'};
+  } catch(e) {
+    return {ok: 0, why: String((e && e.message) || e)};
+  }
+})(arguments[0]);
+"""
+
+# chapterId -> 已处理过的卡片序号；以及 (chapterId, 序号) -> 尝试次数
+_CARD_SEEN = {}
+_CARD_TRIES = {}
+
+
+def _cards_info(driver):
+    """读章节内的卡片标签；单卡片或读不到时返回 None。"""
+    try:
+        info = driver.execute_script(_CARDS_JS)
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    items = info.get('items') or []
+    if len(items) <= 1:
+        return None
+    return info
+
+
+def _switch_card(driver, index) -> bool:
+    """切到章节内第 index 个卡片；返回是否切换成功。"""
+    try:
+        info = driver.execute_script(_SWITCH_CARD_JS, int(index))
+    except Exception:
+        return False
+    return isinstance(info, dict) and bool(info.get('ok'))
+
+
+def _advance_card(driver, chapter_key='') -> bool:
+    """把当前卡片记为已处理，并切到下一个未处理的卡片。
+
+    返回 True 表示**已经切换**，调用方应 `continue` 重新识别这个卡片；
+    返回 False 表示本章所有卡片都处理完了（或者只有一张卡片），可以正常翻页。
+
+    安全阀：
+      · 每张卡片最多尝试 2 次，切不过去就标记已处理，绝不死循环；
+      · 只保留最近 3 个章节的状态，避免长跑时字典无限增长。
+    """
+    info = _cards_info(driver)
+    if not info:
+        return False
+    items = info.get('items') or []
+    key = str(info.get('chapter') or chapter_key or '-')
+    if key not in _CARD_SEEN and len(_CARD_SEEN) >= 3:
+        _CARD_SEEN.clear()
+        _CARD_TRIES.clear()
+    seen = _CARD_SEEN.setdefault(key, set())
+
+    # 当前正在显示的那张，说明刚被 dispatch 处理过（处理器是阻塞的）
+    for item in items:
+        if item.get('active'):
+            seen.add(int(item.get('idx') or 0))
+            break
+
+    for item in items:
+        idx = int(item.get('idx') or 0)
+        if idx <= 0 or idx in seen:
+            continue
+        tried = _CARD_TRIES.get((key, idx), 0)
+        if tried >= 2:
+            seen.add(idx)          # 切了两次都不过去，放弃这张，避免死循环
+            continue
+        _CARD_TRIES[(key, idx)] = tried + 1
+        if _switch_card(driver, idx):
+            titles = ' / '.join(str(i.get('title') or '?') for i in items)
+            print(color.green('本章共 %d 个卡片（%s），切到第 %d 个：%s'
+                              % (len(items), titles, idx, item.get('title') or '')), flush=True)
+            time.sleep(1.5)        # 等 #iframe 换 src 并渲染出任务点
+            return True
+    return False
+
+
 def _find_next_button(driver):
     """找「下一页/下一节」按钮（Selenium 兜底路径，JS 不可用时才走）；找不到返回 None。
 
@@ -2580,7 +2714,7 @@ def run(driver,choice,course_name,API,lock_screen,pass_face,video_title_choice,
                     last_sig = fingerprint
                 if list(page_message_dict.keys()) == ['文本']:
                     # 纯文本章节：没有任务点可做，也不能算「无法识别」
-                    print(color.yellow('该页面是纯文本章节（无任务点），直接翻页'), flush=True)
+                    print(color.yellow('该页面是纯文本章节（无任务点）'), flush=True)
                 else:
                     print(color.green(f'该页面含有{list(page_message_dict.keys())}'), flush=True)
                 # 每个新页面（按身份指纹判定）落一份完整 DOM，供事后离线分析改版/结构
@@ -2622,6 +2756,12 @@ def run(driver,choice,course_name,API,lock_screen,pass_face,video_title_choice,
                         print(color.yellow('该页处理连续失败，跳过该页'), flush=True)
                         unknown_count = 0
                         cond = True      # 允许推进，避免在同一页反复重试
+                # 章节内多卡片（正文 / 视频 / ppt 标签）：当前这张处理完了，
+                # 先切到下一个没处理过的卡片，而不是直接翻到下一节。
+                # 真机 2026-11-22：一门课 51 个任务点只完成 11 个，就是因为
+                # 进入章节时默认激活的永远是 dct1（正文），视频/ppt 在 dct2/dct3 里。
+                if not repeat_page and _advance_card(driver, identity):
+                    continue
             delete_record()
 
         driver.switch_to.default_content()

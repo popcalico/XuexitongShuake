@@ -115,7 +115,24 @@ def main():
           '_is_study_page(driver)' in src[_s:_e])
 
     print()
-    print('=== 6. 真机冒烟脚本存在（真实浏览器验证过） ===')
+    print('=== 6. 章节内多卡片：必须逐张处理，不能只处理当前激活的那张 ===')
+    check('有 _advance_card', 'def _advance_card(' in src)
+    adv = body_of(src, '_advance_card')
+    check('_advance_card 用 active 标记当前卡', "item.get('active')" in adv)
+    check('每张卡片最多试 2 次（防死循环）', 'tried >= 2' in adv)
+    info_fn = body_of(src, '_cards_info')
+    check('单卡片章节直接返回 None（不切卡）', 'len(items) <= 1' in info_fn)
+    check('状态只保留最近 3 个章节', 'len(_CARD_SEEN) >= 3' in adv)
+    cjs = src.split('_CARDS_JS = r"""')[1].split('"""')[0]
+    check('卡片 JS 用 .prev_ul > li[id^=dct]', 'prev_ul > li[id^="dct"]' in cjs)
+    swjs = src.split('_SWITCH_CARD_JS = r"""')[1].split('"""')[0]
+    check('切卡片执行的是 onclick', 'onclick' in swjs and 'new Function' in swjs)
+    # run() 里必须在 dispatch 之后调用，且不在 repeat_page 时切
+    check('run() 调用了 _advance_card', '_advance_card(driver, identity)' in src)
+    check('repeat_page 时不重复切卡', 'not repeat_page and _advance_card' in src)
+
+    print()
+    print('=== 7. 真机冒烟脚本存在（真实浏览器验证过） ===')
     check('有 tests/smoke_text_chapter_live.py',
           os.path.exists(os.path.join('tests', 'smoke_text_chapter_live.py')))
 
