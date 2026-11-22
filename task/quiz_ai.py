@@ -1018,18 +1018,25 @@ class Answer:
             q = self.questionList0[key]
         except Exception:
             return []
+        # 合并所有类型的空位并去重。
+        # 旧实现「第一个有结果的 selector 就返回」，所以同一题里混用 InpDIV 与 textarea 时
+        # 会少算空位（真机日志「第17题填写 1/1 个空」，但页面上明明有两个空）。
+        seen, merged = set(), []
         for by, selector in (
                 (By.CLASS_NAME, 'InpDIV'),
                 (By.CSS_SELECTOR, '[class="edui-editor-iframeholder edui-default"]'),
                 (By.CSS_SELECTOR, '[contenteditable="true"]'),
                 (By.CSS_SELECTOR, 'textarea')):
             try:
-                elements = q.find_elements(by, selector)
-                if elements:
-                    return elements
+                for element in q.find_elements(by, selector):
+                    marker = getattr(element, 'id', None) or id(element)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    merged.append(element)
             except Exception:
                 continue
-        return []
+        return merged
 
     def _blank_frames(self, key):
         """题目里的 iframe 列表，作为「空位内找不到编辑器」时的回退。"""
@@ -1055,9 +1062,11 @@ class Answer:
                     'return arguments[0].innerText || arguments[0].textContent || "";', node)
             except Exception:
                 current = ''
-        a = re.sub(r'\s+', '', str(current or ''))
-        b = re.sub(r'\s+', '', str(value or ''))
-        return bool(b) and b in a
+        # 必须**严格相等**：旧实现用「包含」，所以往 `2` 后面再追加一个 `2` 也能判成功，
+        # 于是同一个空被写了三遍变成 `222`（2026-11-22 真机截图）。
+        a = re.sub(r'[\s\u200b]+', '', str(current or ''))
+        b = re.sub(r'[\s\u200b]+', '', str(value or ''))
+        return bool(b) and a == b
 
     def _node_any_text(self, node) -> str:
         """读节点里已有的内容（value 或 innerText），用于「已有内容就不再写」。
@@ -1101,13 +1110,46 @@ class Answer:
         # 目标较长时才允许「包含」判定，避免 "1" 命中 "11"
         return len(b) >= 2 and b in a
 
+    def _clear_editor(self, node) -> bool:
+        """清空编辑器并**确认真的空了**；清不干净返回 False（调用方就不写）。
+
+        真机 2026-11-22 截图铁证：第 17 题第 1 空最后显示成 `222` —— 同一个空被写了 3 次。
+        两个原因叠加：
+          · `innerHTML=''` / `value=''` 对富文本无效（UE 的内容在 `<p>` 里）；
+          · 回读判定用的是「包含」，`2` 在 `22` 里就算成功，于是越写越长。
+        所以这里必须：全选删除 → JS 清空 → 回读确认，确认不了就不写。
+        """
+        try:
+            node.click()
+        except Exception:
+            pass
+        try:
+            from selenium.webdriver.common.keys import Keys
+            node.send_keys(Keys.CONTROL, 'a')
+            node.send_keys(Keys.DELETE)
+        except Exception:
+            pass
+        try:
+            self.driver.execute_script(
+                "arguments[0].innerHTML = '';"
+                "try { arguments[0].value = ''; } catch(e) {}"
+                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                node)
+        except Exception:
+            pass
+        return not self._node_any_text(node)
+
     def _fill_blank(self, blank_el, text, frames, index):
-        """激活第 index 个空位并写入答案；**回读确认**后才返回 True。"""
-        # 优先**真实点击**：学习通的填空题空位（InpDIV / ueditor iframeholder）
-        # 要靠 focus 事件才会展开编辑器；纯 JS `el.click()` 只派发事件、常常不触发
-        # focus → 编辑器不出现 → 下面既找不到 textarea 也找不到 iframe →
-        # 真机现象就是「有答案却只写进 0/1 个空」（2026-11-22 日志第 15/16/18 题）。
-        # 真实点击被水印/遮罩挡住时再退回 JS 点击。
+        """激活第 index 个空位并写入答案。**一个空只写一次**，回读严格相等才算成功。
+
+        2026-11-22 真机：一个空被写 3 次（显示 `222`）。根因是候选编辑器列表里
+        同一个 iframe 出现了多次（`blank_el` 内的 iframe 与 `frames[index]` 是同一个），
+        每写一次「回读」都因「包含」判定通过不了就继续换下一个候选再写。
+        现在：候选去重；写完无论成败都 `return`，绝不对同一个空写第二遍。
+        """
+        # 优先**真实点击**：学习通的填空空位（InpDIV / ueditor iframeholder）要靠
+        # focus 事件才展开编辑器；纯 JS `el.click()` 只派发事件、常常不触发 focus。
         activated = False
         try:
             blank_el.click()
@@ -1117,60 +1159,57 @@ class Answer:
         if not activated:
             try:
                 self.driver.execute_script("arguments[0].click();", blank_el)
-                activated = True
             except Exception:
                 return False
         # ueditor 是点击之后才往 DOM 里插 iframe 的，给它一点时间挂载
         time.sleep(0.25)
-        # 点击可能把空位元素本身替换掉（StaleElement）：探测一次，
-        # 失效就交回上层「每轮重新取空位」重试，绝不拿旧句柄硬写。
+        # 点击可能把空位元素本身替换掉（StaleElement）：失效就交回上层重新取
         try:
             blank_el.tag_name
         except Exception:
             return False
         value = str(text)
-        # 1) 空位内直接可编辑的节点
+
+        # 候选：空位内可编辑节点 → 空位内 iframe → 题目里对应的那一个 iframe。
+        # **空位内已经有 iframe 时就不再追加 frames[index]**，避免同一个编辑器进两次。
+        node_targets = []
         for by, selector in ((By.CSS_SELECTOR, 'textarea'),
                              (By.CSS_SELECTOR, '[contenteditable="true"]')):
             try:
-                nodes = blank_el.find_elements(by, selector)
-                if nodes:
-                    el = nodes[0]
-                    existing = self._node_any_text(el)
-                    if existing:
-                        if self._same_answer(existing, value):
-                            print(color.yellow('  该空已有相同答案，跳过不重写'), flush=True)
-                            return True
-                        # 已有别的内容（很可能是人工填的）：保留不覆盖，且不计入"已填写"，
-                        # 让白卷闸门能看见它（宁可只保存不提交，也不能覆盖人工答案）
-                        print(color.yellow('  该空已有其它内容（%s），保留不覆盖'
-                                           % existing[:12]), flush=True)
-                        return False
-                    try:
-                        self.driver.execute_script("arguments[0].value = '';", el)
-                    except Exception:
-                        pass
-                    el.send_keys(value)
-                    if self._editor_has_text(el, value):
-                        return True
-                    continue
+                node_targets.extend(blank_el.find_elements(by, selector))
             except Exception:
                 continue
-        # 2) iframe 编辑器：空位内优先，再从题目 iframe 列表的第 index 个往后找。
-        #    题目里常夹着公式/图片等无关 iframe，所以从 index 开始逐个试，
-        #    找到第一个含可编辑节点的才写，避免索引错位把答案串到同一个空。
-        candidates = []
+        inner_frames = []
         try:
-            candidates += blank_el.find_elements(By.TAG_NAME, 'iframe')
+            inner_frames = blank_el.find_elements(By.TAG_NAME, 'iframe')
         except Exception:
             pass
-        # 只取与本题第 index 个空位对应的那一个 iframe。
-        # 旧实现是 `frames[index:]`（本题后面**所有** iframe），一旦前一个候选
-        # 回读判定失败，就会把同一个答案依次写进后面几个空 ——
-        # 真机现象就是「有的空被重复写了好几遍」「答案串到别的空」。
-        if index < len(frames):
-            candidates.append(frames[index])
-        for frame in candidates:
+
+        for target in node_targets:
+            existing = self._node_any_text(target)
+            if existing:
+                if self._same_answer(existing, value):
+                    print(color.yellow('  该空已有相同答案，跳过不重写'), flush=True)
+                    return True
+                print(color.yellow('  该空已有其它内容（%s），保留不覆盖' % existing[:12]),
+                      flush=True)
+                return False
+            if not self._clear_editor(target):
+                continue
+            try:
+                target.send_keys(value)
+            except Exception:
+                continue
+            # 写完就结束：绝不换下一个候选再写一遍
+            if self._editor_has_text(target, value):
+                return True
+            return False
+
+        frames_to_try = list(inner_frames)
+        if not frames_to_try and index < len(frames):
+            frames_to_try = [frames[index]]
+
+        for frame in frames_to_try:
             entered = False
             try:
                 self.driver.switch_to.frame(frame)
@@ -1190,11 +1229,8 @@ class Answer:
                     print(color.yellow('  该空已有其它内容（%s），保留不覆盖'
                                        % existing[:12]), flush=True)
                     return False
-                # 清空再写：不这么做会把多个答案追加成「生我者父母1210」
-                try:
-                    self.driver.execute_script("arguments[0].innerHTML = '';", node)
-                except Exception:
-                    pass
+                if not self._clear_editor(node):
+                    continue
                 try:
                     node.click()
                 except Exception:
@@ -1202,7 +1238,7 @@ class Answer:
                 node.send_keys(value)
                 if self._editor_has_text(node, value):
                     return True
-                continue
+                return False
             except Exception:
                 continue
             finally:
@@ -1219,22 +1255,8 @@ class Answer:
         学习通不同版式用 InpDIV / ueditor iframeholder / contenteditable / textarea，
         这里按优先级逐个探测，不写死一种选择器。
         """
-        try:
-            q = self.questionList0[key]
-        except Exception:
-            return 0
-        for by, value in (
-                (By.CLASS_NAME, 'InpDIV'),
-                (By.CSS_SELECTOR, '[class="edui-editor-iframeholder edui-default"]'),
-                (By.CSS_SELECTOR, '[contenteditable="true"]'),
-                (By.CSS_SELECTOR, 'textarea')):
-            try:
-                n = len(q.find_elements(by, value))
-                if n:
-                    return n
-            except Exception:
-                continue
-        return 0
+        # 与 _blank_elements 同一口径，避免「数出 2 个空、只填 1 个」这类错位
+        return len(self._blank_elements(key))
 
     def _ask_one(self, key):
         """逐题问 AI，返回答案列表；失败返回 []。"""

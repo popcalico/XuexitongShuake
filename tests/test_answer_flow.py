@@ -59,11 +59,20 @@ def main():
     code_lines = [ln for ln in fill.splitlines() if not ln.strip().startswith('#')]
     code_only = '\n'.join(code_lines)
     check('代码里不再用 frames[index:]', 'frames[index:]' not in code_only)
-    check('只取对应的那一个 iframe', 'candidates.append(frames[index])' in code_only)
+    check('空位内已有 iframe 就不再追加题目 iframe',
+          'if not frames_to_try and index < len(frames)' in code_only)
+    check('一个空只写一次（写完即 return，不再换候选）',
+          fill.count('return False') >= 2 and '写完就结束' in fill)
+    check('写前必须清空并确认', '_clear_editor(' in fill)
     check('写之前判断该空是否已有内容', '_node_any_text(' in fill)
     check('已有相同答案 → 跳过不重写', '_same_answer(' in fill
           and '跳过不重写' in fill)
     check('已有其它内容 → 保留不覆盖', '保留不覆盖' in fill)
+    check('清空函数：全选删除 + JS 清空 + 回读确认',
+          all(k in body_of(qsrc, '_clear_editor')
+              for k in ('Keys.CONTROL', 'innerHTML', '_node_any_text')))
+    check('回读改成严格相等（不再包含判定）',
+          'a == b' in body_of(qsrc, '_editor_has_text'))
     check('优先真实点击（能触发 focus，编辑器才展开）',
           fill.index('blank_el.click()') < fill.index('execute_script'))
     check('点击后等编辑器挂载', 'time.sleep(0.25)' in fill)
