@@ -745,9 +745,38 @@ class Answer:
             return []
         return _as_answer_list(raw)
 
+    def _option_already_checked(self, index) -> bool:
+        """这道选择题是否已经有选项被选中。
+
+        2026-11-22 用户反馈：「原本已经作答的题目，还调用 AI 再搜一遍，浪费额度」。
+        根因：`use_ai_wen_da()` 一上来就遍历所有题去查题库/问 AI，
+        「是否已回答」的判断却放在后面 `_click_option()` 里 —— 那时答案已经花钱买到了。
+
+        这里只处理**选择题**（单选/多选/判断）：`aria-checked="true"` 是强信号，
+        不会误判。填空题/简答题的空位里常有占位文字，贸然当成「已作答」会漏答，
+        所以主观题交给 `_fill_blank()` 在写入前判断。
+        """
+        try:
+            options = self.all_optionWebElementList[index] or []
+        except Exception:
+            return False
+        for option in options:
+            try:
+                if option.get_attribute('aria-checked') == 'true':
+                    return True
+            except Exception:
+                continue
+        return False
+
     def use_ai_wen_da(self):
         needs_ai = getattr(self, 'needs_ai_questions', set())
         for i in self.all_title_dit.keys():
+            if self._option_already_checked(i):
+                # 已经选过答案了：不查题库、不问 AI，也不再去点（省额度、不覆盖人工答案）
+                print(color.yellow(f'第{i+1}题已有选中答案，跳过搜索（省额度）'), flush=True)
+                self.num_answer_dit[i] = []
+                self.skipped_questions.add(i)
+                continue
             if i in self.image_questions:
                 # 图片题没有可检索的文本，查题库纯属浪费请求
                 self.num_answer_dit[i] = []
@@ -1030,15 +1059,75 @@ class Answer:
         b = re.sub(r'\s+', '', str(value or ''))
         return bool(b) and b in a
 
+    def _node_any_text(self, node) -> str:
+        """读节点里已有的内容（value 或 innerText），用于「已有内容就不再写」。
+
+        2026-11-22 用户反馈：填空题「有答案、不知道，搜到了又写了一遍」，
+        「有的空被重复写了好几遍」。根因之一是 `_fill_blank` 只看写入是否成功，
+        从不看这个空**是不是本来就有内容**；之二是候选 iframe 用了 `frames[index:]`
+        （本题后面的所有 iframe），回读失败就会把同一个答案往后面几个空里写。
+        """
+        try:
+            current = node.get_attribute('value') or ''
+        except Exception:
+            current = ''
+        if not current:
+            try:
+                current = self.driver.execute_script(
+                    'return (arguments[0].innerText || arguments[0].textContent || "");', node)
+            except Exception:
+                current = ''
+        text = str(current or '').strip()
+        if not text:
+            return ''
+        # 富文本空位常带"请输入答案"之类的占位提示，绝不能被当成"用户已填"，
+        # 否则会一个空都不写、还把这题登记成已完成（等于放行白卷）。
+        compact = re.sub(r'\s+', '', text)
+        hints = ('请输入', '请填写', '输入答案', '点击此处', '在此输入', '填写答案')
+        if len(compact) <= 8 and any(h in compact for h in hints):
+            return ''
+        return text
+
+    @staticmethod
+    def _same_answer(current, target) -> bool:
+        """已有内容与目标答案是否等价（去空格/标点后比较）。"""
+        def norm(x):
+            return re.sub(r'[\s,，、;；。.．"\'`]+', '', str(x or '')).lower()
+        a, b = norm(current), norm(target)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        # 目标较长时才允许「包含」判定，避免 "1" 命中 "11"
+        return len(b) >= 2 and b in a
+
     def _fill_blank(self, blank_el, text, frames, index):
         """激活第 index 个空位并写入答案；**回读确认**后才返回 True。"""
+        # 优先**真实点击**：学习通的填空题空位（InpDIV / ueditor iframeholder）
+        # 要靠 focus 事件才会展开编辑器；纯 JS `el.click()` 只派发事件、常常不触发
+        # focus → 编辑器不出现 → 下面既找不到 textarea 也找不到 iframe →
+        # 真机现象就是「有答案却只写进 0/1 个空」（2026-11-22 日志第 15/16/18 题）。
+        # 真实点击被水印/遮罩挡住时再退回 JS 点击。
+        activated = False
         try:
-            self.driver.execute_script("arguments[0].click();", blank_el)
+            blank_el.click()
+            activated = True
         except Exception:
+            pass
+        if not activated:
             try:
-                blank_el.click()
+                self.driver.execute_script("arguments[0].click();", blank_el)
+                activated = True
             except Exception:
                 return False
+        # ueditor 是点击之后才往 DOM 里插 iframe 的，给它一点时间挂载
+        time.sleep(0.25)
+        # 点击可能把空位元素本身替换掉（StaleElement）：探测一次，
+        # 失效就交回上层「每轮重新取空位」重试，绝不拿旧句柄硬写。
+        try:
+            blank_el.tag_name
+        except Exception:
+            return False
         value = str(text)
         # 1) 空位内直接可编辑的节点
         for by, selector in ((By.CSS_SELECTOR, 'textarea'),
@@ -1047,6 +1136,16 @@ class Answer:
                 nodes = blank_el.find_elements(by, selector)
                 if nodes:
                     el = nodes[0]
+                    existing = self._node_any_text(el)
+                    if existing:
+                        if self._same_answer(existing, value):
+                            print(color.yellow('  该空已有相同答案，跳过不重写'), flush=True)
+                            return True
+                        # 已有别的内容（很可能是人工填的）：保留不覆盖，且不计入"已填写"，
+                        # 让白卷闸门能看见它（宁可只保存不提交，也不能覆盖人工答案）
+                        print(color.yellow('  该空已有其它内容（%s），保留不覆盖'
+                                           % existing[:12]), flush=True)
+                        return False
                     try:
                         self.driver.execute_script("arguments[0].value = '';", el)
                     except Exception:
@@ -1065,7 +1164,12 @@ class Answer:
             candidates += blank_el.find_elements(By.TAG_NAME, 'iframe')
         except Exception:
             pass
-        candidates += list(frames[index:])
+        # 只取与本题第 index 个空位对应的那一个 iframe。
+        # 旧实现是 `frames[index:]`（本题后面**所有** iframe），一旦前一个候选
+        # 回读判定失败，就会把同一个答案依次写进后面几个空 ——
+        # 真机现象就是「有的空被重复写了好几遍」「答案串到别的空」。
+        if index < len(frames):
+            candidates.append(frames[index])
         for frame in candidates:
             entered = False
             try:
@@ -1078,6 +1182,14 @@ class Answer:
                 if not nodes:
                     continue
                 node = nodes[0]
+                existing = self._node_any_text(node)
+                if existing:
+                    if self._same_answer(existing, value):
+                        print(color.yellow('  该空已有相同答案，跳过不重写'), flush=True)
+                        return True
+                    print(color.yellow('  该空已有其它内容（%s），保留不覆盖'
+                                       % existing[:12]), flush=True)
+                    return False
                 # 清空再写：不这么做会把多个答案追加成「生我者父母1210」
                 try:
                     self.driver.execute_script("arguments[0].innerHTML = '';", node)

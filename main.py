@@ -2120,6 +2120,36 @@ def _advance_card(driver, chapter_key='') -> bool:
     return False
 
 
+def _reset_to_default(driver) -> bool:
+    """回到顶层文档；渲染进程卡死时先刷新一次尝试自愈。
+
+    真机 2026-11-22 22:10:39：`run()` 里裸调 `switch_to.default_content()` 抛
+    `TimeoutException: Timed out receiving message from renderer: 45.000`，
+    异常一路冒到 `run_main()`，**整个账号进程直接退出** —— 用户看到的就是
+    「未知原因退出」，而且退出前刚答到第 19 题（前 18 题白答）。
+
+    这里做两级处理：
+      ① 正常切回顶层；
+      ② 切不回就先 refresh（renderer 卡死多半是页面 JS 死循环，刷新通常能救）。
+    都失败返回 False，由调用方按「本课程丢失」处理，**绝不让异常终止整个账号**。
+    """
+    try:
+        driver.switch_to.default_content()
+        return True
+    except Exception as e:
+        print(color.red('切换顶层文档失败（%s），尝试刷新页面恢复'
+                        % type(e).__name__), flush=True)
+    try:
+        driver.refresh()
+        time.sleep(2)
+        driver.switch_to.default_content()
+        print(color.green('刷新后页面已恢复正常'), flush=True)
+        return True
+    except Exception as e:
+        print(color.red('刷新也没能恢复（%s）' % type(e).__name__), flush=True)
+        return False
+
+
 def _find_next_button(driver):
     """找「下一页/下一节」按钮（Selenium 兜底路径，JS 不可用时才走）；找不到返回 None。
 
@@ -2764,7 +2794,11 @@ def run(driver,choice,course_name,API,lock_screen,pass_face,video_title_choice,
                     continue
             delete_record()
 
-        driver.switch_to.default_content()
+        if not _reset_to_default(driver):
+            # 浏览器渲染进程已无响应：只结束本课程，绝不抛异常终止整个账号
+            # （真机 2026-11-22：这里抛 TimeoutException，整个进程退出，前 18 题白答）
+            print(color.red('浏览器渲染进程无响应，结束本课程（不终止整个账号）'), flush=True)
+            return 'lost'
         if cond:
             print(color.green('跳转下一页'), flush=True)
             if not click_next_page(driver, pass_face):
@@ -2972,7 +3006,12 @@ def main(browser, driver_path, phone_number, password, choice, course_lst,API,af
             retry = 0
             stay_retry = 0
             while status == 'lost' and retry < 3:
-                if _is_study_page(driver):
+                # 浏览器卡死时 current_url 也可能超时；这里绝不让它把整个账号带崩
+                try:
+                    in_study = _is_study_page(driver)
+                except Exception:
+                    in_study = False
+                if in_study:
                     stay_retry += 1
                     if stay_retry <= 3:
                         print(color.yellow(
@@ -2994,7 +3033,13 @@ def main(browser, driver_path, phone_number, password, choice, course_lst,API,af
                 retry += 1
                 print(color.yellow(f'页面丢了，回课程页重新定位未完成任务点（第 {retry} 次）'),
                       flush=True)
-                if not _reenter_course(driver, course_name, speed, task_type, phone_number):
+                try:
+                    reentered = _reenter_course(driver, course_name, speed,
+                                                task_type, phone_number)
+                except Exception as e:
+                    print(color.red('回课程页时出错（%s）' % type(e).__name__), flush=True)
+                    reentered = False
+                if not reentered:
                     if retry >= 3:
                         print(color.red('回不到课程页，结束本课程'), flush=True)
                         break
