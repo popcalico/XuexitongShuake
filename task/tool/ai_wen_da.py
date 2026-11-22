@@ -1,4 +1,4 @@
-﻿import re
+import re
 
 import requests
 import time
@@ -12,7 +12,13 @@ import asyncio
 import ast
 from task.tool.DeepSeekAsk import DeepSeekAsk
 from task.tool import quota
-from core import paths
+from core import paths, ai_config
+from core import bounded_executor
+
+
+# 判断题的否定词表：命中任意一个就判「错」。
+# 必须比肯定词先判断——「不正确」里含「正确」，顺序反了就会把答案答反。
+_JUDGE_FALSE_WORDS = ('错误', '不正确', '错', '否', 'false', 'no', '×', '✗')
 
 
 @dataclass
@@ -48,23 +54,46 @@ class Cache:
             'expire': int(time.time()) + expire if expire > 0 else 0
         }
         try:
-            with open(paths.record(f'cache_{key}.pkl'), 'wb') as f:
-                pickle.dump(cache_data, f)
+            # 任务06：新缓存写 JSON（带格式版本），旧 pkl 只读不写
+            import json as _json
+            jp = paths.record(f'cache_{key}.json')
+            tmp = jp + '.tmp'
+            os.makedirs(os.path.dirname(jp) or '.', exist_ok=True)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                _json.dump({'_fmt': 1, 'data': cache_data}, f, ensure_ascii=False)
+            os.replace(tmp, jp)
         except Exception as e:
             print(f"缓存设置失败: {e}")
         return value
 
     @staticmethod
+    def delete(key: str) -> None:
+        """删除一条缓存（清理脏答案用；不存在时静默）。"""
+        for suffix in ('.json', '.pkl'):
+            try:
+                os.remove(paths.record(f'cache_{key}{suffix}'))
+            except OSError:
+                pass
+
+    @staticmethod
     def get(key: str, default: Any = None) -> Any:
-        """获取缓存"""
+        """获取缓存（优先 JSON，旧 pkl 受限读取后迁移）"""
         try:
-            cache_path = paths.record(f'cache_{key}.pkl')
-            with open(cache_path, 'rb') as f:
-                cache_data = pickle.load(f)
-                if cache_data['expire'] > 0 and cache_data['expire'] < time.time():
-                    os.remove(cache_path)
-                    return default
-                return cache_data['value']
+            from core import safe_pickle
+            cache_data, _ = safe_pickle.load_json_or_pickle(
+                paths.record(f'cache_{key}.json'),
+                paths.record(f'cache_{key}.pkl'),
+                validator=lambda v: isinstance(v, dict) and 'value' in v and 'expire' in v)
+            if not cache_data:
+                return default
+            if cache_data['expire'] > 0 and cache_data['expire'] < time.time():
+                # 过期：只删 JSON（旧 pkl 已迁移备份，保留不误删用户数据）
+                try:
+                    os.remove(paths.record(f'cache_{key}.json'))
+                except OSError:
+                    pass
+                return default
+            return cache_data['value']
         except FileNotFoundError:
             return default
         except Exception as e:
@@ -75,9 +104,55 @@ class Cache:
 class AnswerAPI:
     """答题API类"""
 
+    # 题库接口并发上限（任务08）：避免同时打太多请求触发风控
+    BANK_MAX_CONCURRENCY = 3
+    BANK_TASK_TIMEOUT = 25  # 单接口最长等待秒数，超时只影响该接口
+
     def __init__(self):
         self.cache = Cache()
         self.api_scores = {}  # API评分记录
+
+    async def _gather_bounded(self, coros, forms):
+        """并发执行题库接口：限制并发数 + 单接口超时隔离 + 结果顺序稳定。
+
+        任务08：任一接口超时/异常只返回一个空 AnswerResult，不影响其它接口；
+        保持传入顺序（与既有匹配顺序一致），不把 AI 答案写缓存。
+        """
+        # V5.1 第25节：把默认执行器换成进程内共享的**有界线程池**，
+        # 连续超时时底层同步 HTTP 线程不会无限堆积。
+        # 真实取消边界：asyncio.wait_for 只取消协程，**不会终止底层线程**；
+        # 线程靠 requests 的 connect/read timeout 自己结束，池子限制其总数与排队长度。
+        bounded_executor.install()
+        # 局部信号量：每次调用在当前事件循环内创建，兼容每题 asyncio.run 的现状
+        sem = asyncio.Semaphore(self.BANK_MAX_CONCURRENCY)
+        batch = bounded_executor.next_batch()
+
+        async def one(coro, form):
+            async with sem:
+                bounded_executor.record_request()
+                try:
+                    result = await asyncio.wait_for(coro, timeout=self.BANK_TASK_TIMEOUT)
+                    # 迟到响应隔离：只采信本批次协程自己返回的 AnswerResult；
+                    # 被取消的协程结果无处写入，不会串到别的接口或下一道题。
+                    if not isinstance(result, AnswerResult):
+                        return AnswerResult(form=form, answer=[],
+                                            msg='结果类型异常(批次%d)' % batch)
+                    return result
+                except asyncio.TimeoutError:
+                    bounded_executor.record_timeout()
+                    return AnswerResult(form=form, answer=[],
+                                        msg='单接口超时(批次%d)' % batch,
+                                        duration=int(self.BANK_TASK_TIMEOUT * 1000))
+                except Exception as e:
+                    return AnswerResult(form=form, answer=[], error=e,
+                                        msg='单接口失败(批次%d)' % batch)
+
+        return await asyncio.gather(*(one(c, f) for c, f in zip(coros, forms)))
+
+    @staticmethod
+    def bank_executor_stats():
+        """供性能报告/压力测试读取线程池上限证据。"""
+        return bounded_executor.stats()
 
 
     def score(self, api_name: str, score: int):
@@ -101,15 +176,16 @@ class AnswerAPI:
         """获取所有答案源（受额度闸门约束：超出就返回空结果，不联网）"""
         if not quota.acquire('', '题库'):
             return [AnswerResult(form='quota', answer=[], duration=0)]
-        tasks = [self.get_answer4(question),self.get_answer3(question)]
-        return await asyncio.gather(*tasks)
+        tasks = [self.get_answer4(question), self.get_answer3(question)]
+        return await self._gather_bounded(tasks, ['免费题库', '题库3'])
 
     async def get_answers_free(self, question: Question) -> List[AnswerResult]:
         """免费答案获取（受额度闸门约束）"""
         if not quota.acquire('', '题库'):
             return [AnswerResult(form='quota', answer=[], duration=0)]
-        tasks = [self.get_main_answer(question), self.get_answer1(question),self.get_answer2(question)]
-        return await asyncio.gather(*tasks)
+        tasks = [self.get_main_answer(question), self.get_answer1(question),
+                 self.get_answer2(question)]
+        return await self._gather_bounded(tasks, ['主题库', '一之题库', 'muketool'])
 
     async def get_answer1(self, question: Question) -> AnswerResult:
         """从一之题库获取答案"""
@@ -118,12 +194,10 @@ class AnswerAPI:
 
         try:
             start_time = time.time()
-            response = requests.post(
-                "http://cx.icodef.com/wyn-nb?v=4",
-                json=data,
-                headers=headers,
-                timeout=10
-            )
+            # 任务08：同步网络请求放到线程，避免阻塞事件循环（真实并发）
+            response = await asyncio.to_thread(
+                requests.post, "http://cx.icodef.com/wyn-nb?v=4",
+                json=data, headers=headers, timeout=10)
             duration = int((time.time() - start_time) * 1000)
 
             if response.status_code == 200:
@@ -182,11 +256,9 @@ class AnswerAPI:
 
         try:
             start_time = time.time()
-            response = requests.post(
-                "https://api.muketool.com/cx/v2/query",
-                json=data,
-                timeout=10
-            )
+            response = await asyncio.to_thread(
+                requests.post, "https://api.muketool.com/cx/v2/query",
+                json=data, timeout=10)
             duration = int((time.time() - start_time) * 1000)
 
             if response.status_code == 200:
@@ -225,11 +297,9 @@ class AnswerAPI:
 
         try:
             start_time = time.time()
-            response = requests.post(
-                "https://aiask.wk66.top/api/search",
-                json=data,
-                timeout=10
-            )
+            response = await asyncio.to_thread(
+                requests.post, "https://aiask.wk66.top/api/search",
+                json=data, timeout=10)
             duration = int((time.time() - start_time) * 1000)
 
             if response.status_code == 200:
@@ -282,7 +352,8 @@ class AnswerAPI:
             start_time = time.time()
 
             # 发送 GET 请求
-            response = requests.get(base_url, params=params, timeout=10)
+            response = await asyncio.to_thread(
+                requests.get, base_url, params=params, timeout=10)
 
             # 检查 HTTP 状态码
             response.raise_for_status()
@@ -357,7 +428,9 @@ class AnswerAPI:
         }
         start_time = time.time()
         try:
-            response = requests.post(url, headers=headers, data=data)
+            # 任务07：补显式超时；任务08：to_thread 真实并发
+            response = await asyncio.to_thread(
+                requests.post, url, headers=headers, data=data, timeout=(5, 15))
             response.raise_for_status()  # 检查HTTP错误
 
             result = response.json()
@@ -427,6 +500,17 @@ class AnswerAPI:
         cache_key = f"ques1_{self.question_hash(question)}"
         self.cache.set(cache_key, cache_data)
 
+    def drop_cache_answer(self, question: Question) -> None:
+        """删掉某道题的缓存。
+
+        用于清理「答案与题型根本不匹配」的脏缓存（例如判断题里存着
+        `['科学社会主义']`）。留着它每次都会白查一遍再被判无答案。
+        """
+        try:
+            self.cache.delete(f"ques1_{self.question_hash(question)}")
+        except Exception:
+            pass
+
     async def get_cache_answer(self, question: Question) -> AnswerResult:
         """从缓存获取答案"""
         cache_key = f"ques1_{self.question_hash(question)}"
@@ -461,15 +545,38 @@ class AnswerMatcher:
 
     @staticmethod
     def is_true(text: str) -> bool:
-        """判断是否为正确"""
-        true_keywords = ["正确", "对", "是", "true", "yes", "A"]
-        return any(keyword in text for keyword in true_keywords)
+        """判断答案是否表示「正确」。
+
+        2026-11-19 收紧：旧实现是 `any(kw in text for kw in [...'是'...])`，
+        只要答案里出现一个「是」或「对」就算正确 —— 于是
+        「这是错误的」「不正确」「是国家的、民族的…」这类答案全会被判成「对」。
+        现在规则：
+
+        1. **否定词优先**（「错误 / 不正确 / 否 / false / no」直接判否，
+           否则「不正确」里的「正确」会先把结果定成真）；
+        2. 单字母/符号：只有**整个答案**就是 A/T/√/对/是 时才算；
+        3. 长文本只认明确的肯定词（正确 / true / yes），不认零散的「是」「对」。
+        """
+        s = str(text or '').strip()
+        if not s:
+            return False
+        low = s.lower()
+        if any(kw in low for kw in _JUDGE_FALSE_WORDS):
+            return False
+        if s in ('A', 'a', 'T', 't', '√', '✓', '对', '是', '正确', 'true', 'yes'):
+            return True
+        return any(kw in low for kw in ('正确', 'true', 'yes'))
 
     @staticmethod
     def is_false(text: str) -> bool:
-        """判断是否为错误"""
-        false_keywords = ["错误", "错", "否", "false", "no", "B"]
-        return any(keyword in text for keyword in false_keywords)
+        """判断答案是否表示「错误」（否定优先，避免「不正确」被当成肯定）。"""
+        s = str(text or '').strip()
+        if not s:
+            return False
+        low = s.lower()
+        if s in ('B', 'b', 'F', 'f', '×', '✗', '错', '否', '错误', 'false', 'no'):
+            return True
+        return any(kw in low for kw in ('错误', '不正确', 'false'))
 
     @staticmethod
     def remove_html(html: str) -> str:
@@ -654,9 +761,11 @@ class AutoAnswer:
     async def auto_answer_question(self, question: Question) -> Dict[str, Any]:
         """自动回答单个题目"""
         global status
-        # 填空/简答这类题只能人工写，程序既点不了也填不了；直接跳过，
-        # 免得每道题都去查题库 + 问 AI，白白消耗额度（用户明确要求）。
-        if str(question.type) in ('2', '9'):
+        from core import runtime
+        # 「截图跳过」策略下：填空/简答直接跳过，免得白耗额度。
+        # 默认「AI 尽力完成」策略下放行，让题库/AI 兜底给出文本答案，
+        # 再由 quiz_ai 的 _write_answer 填进作答区（AI 结果仍不写缓存）。
+        if str(question.type) in ('2', '9') and not runtime.ai_effort_enabled():
             print(f'⏭️ 题型 {question.type}（填空/简答）无法自动作答，跳过', flush=True)
             return {'res': '', 'haveAnswer': False}
         print(f"\n🔍 正在搜索题目答案...",flush=True)
@@ -664,11 +773,23 @@ class AutoAnswer:
 
         # 1. 尝试从缓存获取答案
         cache_result = await self.api.get_cache_answer(question)
-        print(f"📦 缓存查询结果: {'找到' if cache_result.answer else '未找到'}",flush=True)
+        cache_usable = False
+        if cache_result.answer:
+            # 缓存里可能躺着脏答案（旧版本缓存的 AI 结果、题库串题等）。
+            # 例如判断题存了 `['科学社会主义']`——它永远匹配不到「对/错」两个选项，
+            # 旧逻辑仍把它当命中，于是跳过网络查询、直接判「所有来源均未找到答案」，
+            # 白费一次机会后才去问 AI。现在先验证能不能真的匹配本题。
+            probe = self.matcher.api_answer_match([cache_result], question)
+            cache_usable = bool(probe.get('haveAnswer'))
+            if not cache_usable:
+                print(f"⚠️ 缓存答案 {cache_result.answer} 与本题型不匹配（脏数据），"
+                      f"已删除并重新查询", flush=True)
+                self.api.drop_cache_answer(question)
+        print(f"📦 缓存查询结果: {'找到' if cache_usable else '未找到'}",flush=True)
 
-        # 2. 如果缓存没有，从API获取
-        if not cache_result.answer :
-            if 'sk-' in question.API:
+        # 2. 如果缓存没有（或不可用），从API获取
+        if not cache_usable:
+            if ai_config.is_key_valid(question.API):
                 print("🌐 开始从网络API获取答案...",flush=True)
                 time.sleep(1)
                 api_results = await self.api.get_answers_free(question)

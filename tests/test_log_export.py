@@ -274,7 +274,8 @@ check('start.py 顶层导入导出弹窗',
       'from gui.log_export_dialog import open_export_dialog' in start_py)
 check('start.py 有导出按钮且绑定到弹窗',
       'export_log_button' in start_py and 'open_export_dialog(self.root)' in start_py)
-check('主页日志区已扩到 4 列', 'columnspan=4' in start_py)
+check('主页日志区至少 4 列（新增「开始考试」按钮后为 5 列）',
+      'columnspan=4' in start_py or 'columnspan=5' in start_py)
 check('导出按钮纳入主题换色列表', 'self.export_log_button,' in start_py)
 check('selftest 覆盖两个新模块',
       "'core.log_export'" in start_py and "'gui.log_export_dialog'" in start_py)

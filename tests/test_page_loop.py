@@ -22,6 +22,10 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
+# 必须隔离数据目录：core.run() 会调用 dom_dump 落盘，不隔离就会把测试桩
+# 写进用户真实 record/DOM，把当天配额（5000）吃光后真机一个 DOM 都不记
+# （2026-11-19 实际发生过：旧上限 200 被本文件一轮回归写满）。
+os.environ['XXT_HOME'] = tempfile.mkdtemp(prefix='xxt_pageloop_')
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 
 from selenium.common.exceptions import ElementNotInteractableException, NoSuchElementException
@@ -174,8 +178,12 @@ def main():
 
     # ---------- 2) 点击下一页：只区分「到底了」和「点过了」 ----------
     core.error_num = 0
-    check('课程到底（按钮不可点）-> False',
-          core.click_next_page(ClickDriver(ElementNotInteractableException('done')), 0) is False)
+    # 2026-11-19 变更（审计 P0-5）：按钮「不可交互」不再等于「课程到底」。
+    # 旧逻辑直接返回 False → run() 当 done → 整门课被误判学完。
+    # 现在先退化为 JS 点击（本桩 execute_script 不抛，视为点到了），
+    # 因此返回 True（让 run() 继续按指纹判断有没有真换页）。
+    check('按钮不可交互不再直接判课程完结',
+          core.click_next_page(ClickDriver(ElementNotInteractableException('done')), 0) is True)
     check('正常点击 -> True', core.click_next_page(ClickDriver(), 0) is True)
 
     # ---------- 3) 阈值 ----------

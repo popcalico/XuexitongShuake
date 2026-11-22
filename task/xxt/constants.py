@@ -55,3 +55,8 @@ MAX_CHECK_INTERVAL = 120        # 空闲退避的上限（秒）
 MAX_RUNTIME = 4 * 3600          # 最长连续运行时间（秒），到点自动停止
 COURSE_REFRESH_CYCLES = 30      # 每 30 轮刷新一次课程列表（按 30 秒间隔约 15 分钟）
 REQUEST_INTERVAL = 0.25         # 位置签到坐标修正时的请求间隔
+# 2026-11-16 任务09：单次位置签到的独立总预算。
+# 已有的 MAX_ROUNDS=10 / MAX_WALK=100 是「轮数/步长」，两者相乘最坏可达
+# 10×(4+2×100)=2040 次请求。这里加一个独立的全局预算硬闸，超了立即停。
+LOCATION_MAX_TOTAL_REQUESTS = 60   # 单次位置签到最多发 60 次修正请求
+LOCATION_TIME_BUDGET = 90           # 单次位置签到总时间预算（秒）

@@ -1,6 +1,7 @@
 """更新检查与网盘选择弹窗"""
 import random
 import re
+import threading
 import tkinter as tk
 import customtkinter as ctk
 import requests
@@ -40,7 +41,11 @@ def parse_version(text: str):
 
 
 class UpdateChecker:
-    RELEASE_URL = 'https://api.github.com/repos/Mortal004/CourseStudyHelper/releases/latest'
+    # 上游作者的发布仓库。
+    # 历史值写的是 `Mortal004/CourseStudyHelper`，该仓库**不存在**（API 恒返回 404），
+    # 于是「检查更新」每次都落到「请检查网络连接」，等于这个功能一直是坏的。
+    # 2026-11-19 核对作者真实仓库为 `Xuexitong_shuake`，改为它。
+    RELEASE_URL = 'https://api.github.com/repos/Mortal004/Xuexitong_shuake/releases/latest'
 
     def __init__(self, root, get_version, get_colors):
         self.root = root
@@ -57,7 +62,36 @@ class UpdateChecker:
         return str(version) in str(file_name)
 
     def check(self):
-        text = ''
+        """同步检查更新（保留给显式调用方；**不要在 GUI 主线程里对启动路径用**）。
+
+        2026-11-19：拆成 `_fetch()`（纯网络）+ `_apply()`（可能弹窗）。
+        原因是原来 `requests.get(timeout=10)` 与 tkinter 弹窗混在一起，
+        启动时在 `after(800)` 回调里直接跑，网络慢就把主线程冻结最多 10 秒。
+        """
+        return self._apply(self._fetch())
+
+    def check_async(self, on_done):
+        """后台线程做网络请求，回到主线程再弹窗/更新文字。返回线程对象。
+
+        `on_done(text)` 一定在主线程被调用（通过 `root.after`），
+        所以回调里可以安全操作控件。
+        """
+        def worker():
+            payload = self._fetch()
+            try:
+                self.root.after(0, lambda: on_done(self._apply(payload)))
+            except Exception:
+                # 窗口已销毁（用户启动后立刻关掉）：静默丢弃结果
+                pass
+
+        th = threading.Thread(target=worker, daemon=True, name='update-check')
+        th.start()
+        return th
+
+    def _fetch(self):
+        """只做网络请求，**绝不碰 tkinter**；返回结构化结果供主线程决定怎么展示。"""
+        payload = {'ok': False, 'latest': False, 'file_name': '',
+                   'version': self.get_version(), 'text': ''}
         try:
             headers = {"User-Agent": random.choice([
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/58.0.3029.110 Safari/537.3",
@@ -65,27 +99,42 @@ class UpdateChecker:
                 "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:54.0) Gecko/20100101 Firefox/54.0",
             ])}
             response = requests.get(self.RELEASE_URL, headers=headers, timeout=10)
-            if response.status_code == 200:
-                release_info = response.json()
-                self.updata_concent = release_info.get('body', '')
-                assets = release_info.get('assets', [])
-                if assets:
-                    file_name = assets[0].get('name', '')
-                    version = self.get_version()
-                    if self._is_latest(version, file_name):
-                        text = '\n当前版本为最新版本，无需更新！'
-                        logger.info(f'版本{version}已是最新')
-                    else:
-                        # 只有确实有新版本才弹窗，避免「已是最新」时窗口一闪而过
-                        announce = self._show_selection()
-                        text = f'\n检测到有新版本可用\n{announce}'
-                        logger.info(f'版本{version}需要更新到{file_name}')
+            if response.status_code != 200:
+                if response.status_code == 404:
+                    # 仓库改名/删除都会走到这里：提示要具体，不要笼统说「检查网络」
+                    payload['text'] = '\n检查更新失败：上游发布地址不可用（仓库可能已改名）'
+                    logger.error('更新检查 404：%s', self.RELEASE_URL)
+                else:
+                    payload['text'] = '\n检查更新失败，请检查网络连接！'
+                    logger.error('更新检查 HTTP %s', response.status_code)
+                return payload
+            release_info = response.json()
+            self.updata_concent = release_info.get('body', '')
+            assets = release_info.get('assets', [])
+            payload['ok'] = True
+            if not assets:
+                return payload
+            file_name = assets[0].get('name', '')
+            payload['file_name'] = file_name
+            payload['latest'] = self._is_latest(payload['version'], file_name)
+            if payload['latest']:
+                logger.info(f"版本{payload['version']}已是最新")
             else:
-                text = '\n检查更新失败，请检查网络连接！'
+                logger.info(f"版本{payload['version']}需要更新到{file_name}")
         except Exception as e:
-            text='\n检查更新失败，请检查网络连接！'
+            payload['text'] = '\n检查更新失败，请检查网络连接！'
             logger.error(f'检查更新失败：{e}')
-        return text
+        return payload
+
+    def _apply(self, payload):
+        """在主线程把网络结果变成界面文字；只有确实有新版本才弹窗。"""
+        if not payload.get('ok'):
+            return payload.get('text') or ''
+        if payload.get('latest'):
+            return '\n当前版本为最新版本，无需更新！'
+        # 只有确实有新版本才弹窗，避免「已是最新」时窗口一闪而过
+        announce = self._show_selection()
+        return f'\n检测到有新版本可用\n{announce}'
 
     def _parse_update_content(self):
         """解析更新内容，分离公告、更新说明和网盘链接"""

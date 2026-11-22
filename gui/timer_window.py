@@ -34,18 +34,29 @@ class TimerWindow:
         end_entry = ctk.CTkEntry(win, width=120, font=font)
         end_entry.grid(row=1, column=1, padx=10, pady=10)
         end_entry.insert(0, end_time)
-        win.protocol("WM_DELETE_WINDOW", lambda :self._set(win, start_entry.get().strip(), end_entry.get().strip()))
+        # 关闭窗口 = 取消定时。旧实现把 × 绑成 _set（「开启定时」），
+        # 用户不想设、直接点 × 反而会把定时学习打开并落盘（2026-11-19 审计）。
+        win.protocol("WM_DELETE_WINDOW", lambda: self._cancel(win))
 
         ctk.CTkButton(win, text="开启定时", fg_color=colors[0],
                       hover_color=colors[2], font=font,
                       command=lambda: self._set(win, start_entry.get().strip(),
                                                 end_entry.get().strip())
-                      ).grid(row=2, column=0,columnspan=2, padx=10, pady=20)
+                      ).grid(row=2, column=0, padx=10, pady=20)
+        ctk.CTkButton(win, text="关闭", fg_color=colors[0],
+                      hover_color=colors[2], font=font,
+                      command=lambda: self._cancel(win)
+                      ).grid(row=2, column=1, padx=10, pady=20)
 
-        # ctk.CTkButton(win, text="禁用定时", fg_color=colors[0],
-        #               hover_color=colors[2], font=font,
-        #               command=lambda: self._cancel(win)
-        #               ).grid(row=2, column=1, padx=10, pady=20)
+    def _cancel(self, window):
+        """关闭/取消：通知调用方关掉定时，然后销毁窗口。"""
+        try:
+            self.on_cancel()
+        finally:
+            try:
+                window.destroy()
+            except Exception:
+                pass
 
     def _set(self, window, start_str, end_str):
         pattern = r"^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$"

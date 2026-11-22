@@ -18,6 +18,7 @@ from urllib.parse import quote
 from . import constants, storage
 from .client import XXTClient
 from .crypto import aes_encrypt
+from core.login_identity import mask_phone
 
 
 class LoginError(Exception):
@@ -111,11 +112,23 @@ def do_login(phone: str, password: str) -> Tuple[Optional[XXTClient], str]:
     return client, "登录成功: %s (uid=%s)" % (name, uid)
 
 
-def restore_client(sign_text) -> Optional[XXTClient]:
-    """用本地保存的信息恢复会话; Cookie 失效时自动用保存的密码重登"""
+def restore_client(sign_text, expected_phone: str = None) -> Optional[XXTClient]:
+    """用本地保存的信息恢复会话; Cookie 失效时自动用保存的密码重登。
+
+    2026-11-16 P0：恢复的会话必须属于本次选择的账号。传入 expected_phone 时
+    先比对本地保存的 username，不匹配直接拒绝（让 bootstrap 改用传入凭据登录），
+    绝不把上一个账号的会话当成当前账号。
+    """
     cfg = storage.load_config()
     if not cfg:
         return None
+    if expected_phone:
+        saved = str(cfg.get('username') or '').strip()
+        want = str(expected_phone).strip()
+        if saved and want and saved != want:
+            storage.log("本地会话属于账号 %s，与本次选择的 %s 不符，拒绝复用"
+                        % (mask_phone(saved), mask_phone(want)), sign_text=sign_text)
+            return None
 
     client = XXTClient(uid=cfg.get("uid", ""), fid=cfg.get("fid", ""),
                        name=cfg.get("real_name") or cfg.get("username", ""),

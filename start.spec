@@ -44,7 +44,9 @@ datas += [
     ('task/tool/speed.crx', 'task/tool'),
     ('task/tool/zyb-227372.crx', 'task/tool'),
 ]
-hiddenimports += ['main']
+# 考试适配器只在 main() 的函数内 import，显式带上防止打包后漏模块
+hiddenimports += ['main', 'task.do_exam', 'task.exam_answer_kb', 'task.exam_standalone',
+                  'task.finish_vote']
 
 a = Analysis(
     ['start.py'],

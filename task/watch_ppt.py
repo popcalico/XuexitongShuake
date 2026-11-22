@@ -10,6 +10,8 @@ from task.tool import color
 from task.tool.common import Common
 
 class PPT(Common):
+    REVIEWABLE = True   # 复习模式下已完成也重刷（刷学习时长）
+
     def __init__(self, driver, course_name):
         super().__init__(
             driver,

@@ -4,6 +4,8 @@ import json
 import os
 import zipfile
 
+# 手工诊断脚本（不在 test_* 里，不会被套件收集）。
+# 用本文件所在位置反推工程根，避免写死绝对路径后换目录就失效。
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for name in ('chrome-extension.crx', 'speed.crx', 'zyb-227372.crx'):
     path = os.path.join(ROOT, 'task', 'tool', name)

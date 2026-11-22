@@ -1,31 +1,73 @@
-﻿import base64
-import os
-import re
+# -*- coding: utf-8 -*-
+"""AI 答题客户端（2026-11-10 改造为 OpenAI 兼容）。
+
+历史：本模块原先写死 `base_url=https://api.deepseek.com`、`model=deepseek-v4-flash`，
+并用 `'sk-' in key` 判断 Key 是否有效，只能调 DeepSeek 官方。
+
+现在：地址 / 模型 / 超时全部由 `core.ai_config` 从配置读取，可接入任意
+OpenAI 兼容服务（DeepSeek、OpenAI、通义/豆包兼容端点、自建代理、本地 Ollama 等）。
+模块名、函数名 `DeepSeekAsk` / `DeepSeekAskImage`、常量 `MODEL` 均保持不变，
+避免改动十余处调用方与既有纯桩测试。
+
+默认配置仍指向 DeepSeek，因此不填新字段时行为与改造前一致。
+"""
+import base64
 
 from task.tool import color
 from task.tool import quota
-from openai import OpenAI
+from core import ai_config
 
-# 固定使用的模型（不再随机选择）
-MODEL = 'deepseek-v4-flash'
+# 兼容旧引用（tests/manual_vision_probe.py 会 import 它）
+MODEL = ai_config.DEFAULT_MODEL
 
 
 def _image_mime(path):
     return 'image/jpeg' if str(path).lower().endswith(('.jpg', '.jpeg')) else 'image/png'
 
 
-def DeepSeekAskImage(API_KEY, prompt, image_paths, timeout=90):
-    """多模态：把题目截图（题干+选项）交给 v4-flash，返回模型原文。
+def _log_config():
+    """每次实际请求前打一行配置摘要，便于排查「配了却不生效」。绝不含 Key。"""
+    try:
+        print(color.yellow(ai_config.describe()), flush=True)
+    except Exception:
+        pass
 
-    图片以 base64 data URL 内联发送（OpenAI 兼容格式），不依赖公网可访问的图床。
-    失败（无 key / 读文件失败 / 接口报错）时返回空串，由调用方决定跳过还是随机。
+
+def _chat(api_key, messages, *, vision=False, timeout_default=None, temperature=None):
+    """统一的单次 chat 调用；失败一律返回 None，由调用方决定降级策略。"""
+    cfg = ai_config.resolve()
+    kwargs = {
+        'model': ai_config.model_for(cfg, vision=vision),
+        'messages': messages,
+        'stream': False,
+    }
+    if temperature is not None:
+        kwargs['temperature'] = temperature
+    timeout = ai_config.timeout_for(cfg, default=timeout_default)
+    if timeout:
+        kwargs['timeout'] = timeout
+    try:
+        client = ai_config.build_client(api_key, cfg=cfg)
+        response = client.chat.completions.create(**kwargs)
+        return (response.choices[0].message.content or '').strip()
+    except Exception as e:
+        print(color.red('AI 请求失败 [%s] %s: %s'
+                        % (ai_config.normalize_base_url(cfg.get('ai_base_url')),
+                           kwargs['model'], str(e)[:300])), flush=True)
+        return None
+
+
+def DeepSeekAskImage(API_KEY, prompt, image_paths, timeout=90):
+    """多模态：把题目截图（题干+选项）交给视觉模型，返回模型原文。
+
+    图片以 base64 data URL 内联发送（OpenAI 兼容格式），不依赖公网图床。
+    失败（无 key / 读文件失败 / 接口报错）时返回空串，由调用方跳过或随机。
     """
-    if 'sk-' not in (API_KEY or '') or API_KEY == 'sk-open_deepseek':
+    if not ai_config.is_key_valid(API_KEY):
         return ''
-    # 额度闸门：图片题每题只问 1~2 次，超了就跳过，避免同一道题反复消耗。
-    # 指纹要带上图片路径，否则所有图片题共用同一个 prompt 会被当成"同一道题"。
+    # 额度闸门：图片题每题只问 1~2 次；指纹带图片路径，避免所有图片题共用一个指纹
     if not quota.acquire(quota.question_key(prompt + '|' + '|'.join(map(str, image_paths))),
-                       'deepseek-image'):
+                         'deepseek-image'):
         return ''
 
     content = [{"type": "text", "text": prompt}]
@@ -44,41 +86,36 @@ def DeepSeekAskImage(API_KEY, prompt, image_paths, timeout=90):
     if len(content) == 1:
         return ''
 
-    try:
-        client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": content}],
-            temperature=0.2,
-            timeout=timeout,
-            stream=False,
-        )
-        answer = (response.choices[0].message.content or '').strip()
-    except Exception as e:
-        print(color.red(f'图片题识别请求失败: {e}'), flush=True)
+    _log_config()
+    answer = _chat(API_KEY, [{"role": "user", "content": content}],
+                   vision=True, timeout_default=timeout, temperature=0.2)
+    if answer is None:
         return ''
     print(color.yellow(f'图片题模型返回: {answer!r}'), flush=True)
     return answer
 
 
-def DeepSeekAsk(API_KEY, title ,_type):
+def DeepSeekAsk(API_KEY, title, _type):
+    """按题型构造 prompt，返回模型原文（调用方再解析成答案列表）。
 
-    if _type in ['单选题','判断题']:
-        prompt=('不要其他话语，我仅需要这些题目的选择答案，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
-                '答案必须从给你的选项中选择，并且只能是其中一个答案，不能自己编造答案,'
-                '最终你给出的答案格式应当类似于下面这样：["答案"]\n')
-    elif _type=='多选题':
-        prompt=('不要其他话语，我仅仅需要这些题目的选择答案哟，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
-                '答案必须从给你的选项中选择，可以选择多个答案，不能自己编造答案,'
-                '最终你给出的答案格式应当类似于下面这样：["答案1","答案2",...]\n')
-    elif _type in ['简答题','论述题']:
-        prompt=('不要其他话语，我仅仅需要这些题目的选择答案哟，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
-                '只需给出文字答案即可,不要有多余的内容,答案要都在列表内，不要在列表后再加什么内容,'
-                '最终你给出的答案格式应当类似于下面这样：["答案"]\n')
-    elif _type=='填空题':
-        prompt=('不要其他话语，我仅仅需要这些题目的选择答案哟，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
-                '只需给出文字答案即可,不要有多余的内容,答案要都在列表内，不要在列表后再加什么内容,有多少个空，列表中就要有多少个元素,'
-                '最终你给出的答案格式应当类似于下面这样：["答案"]或["答案1","答案2",...]\n')
+    Key 无效、被限流、请求失败都返回 '[]'，绝不抛异常中断答题流程。
+    """
+    if _type in ['单选题', '判断题']:
+        prompt = ('不要其他话语，我仅需要这些题目的选择答案，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
+                  '答案必须从给你的选项中选择，并且只能是其中一个答案，不能自己编造答案,'
+                  '最终你给出的答案格式应当类似于下面这样：["答案"]\n')
+    elif _type == '多选题':
+        prompt = ('不要其他话语，我仅仅需要这些题目的选择答案哟，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
+                  '答案必须从给你的选项中选择，可以选择多个答案，不能自己编造答案,'
+                  '最终你给出的答案格式应当类似于下面这样：["答案1","答案2",...]\n')
+    elif _type in ['简答题', '论述题']:
+        prompt = ('不要其他话语，我仅仅需要这些题目的选择答案哟，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
+                  '只需给出文字答案即可,不要有多余的内容,答案要都在列表内，不要在列表后再加什么内容,'
+                  '最终你给出的答案格式应当类似于下面这样：["答案"]\n')
+    elif _type == '填空题':
+        prompt = ('不要其他话语，我仅仅需要这些题目的选择答案哟，返回的答案必须是列表格式，列表中的每个元素都是字符串,'
+                  '只需给出文字答案即可,不要有多余的内容,答案要都在列表内，不要在列表后再加什么内容,有多少个空，列表中就要有多少个元素,'
+                  '最终你给出的答案格式应当类似于下面这样：["答案"]或["答案1","答案2",...]\n')
     else:
         prompt = '''请根据以下题目要求回答问题：
                                                   1.不要其他话语，我仅仅需要这些题目的选择答案哟
@@ -103,22 +140,18 @@ def DeepSeekAsk(API_KEY, title ,_type):
                                                     \n'''
     prompt += title
 
-    if 'sk-' in API_KEY:
-        # 额度闸门：超了直接返回空列表，由调用方按"没答案"处理
-        if not quota.acquire(quota.question_key(title), 'deepseek'):
-            return '[]'
-        message = {"role": "user", "content": prompt}
-        client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[message],
-            temperature=1.3,
-            stream=False
-        )
-        answer = response.choices[0].message.content
-    else:
-        print(color.red('请输入正确的deepseek API_KEY'), flush=True)
+    if not ai_config.is_key_valid(API_KEY):
+        print(color.red('未配置有效的 API Key，跳过 AI 作答'), flush=True)
         return '[]'
+    # 额度闸门：超了直接返回空列表，由调用方按「没答案」处理
+    if not quota.acquire(quota.question_key(title), 'deepseek'):
+        return '[]'
+
+    _log_config()
+    answer = _chat(API_KEY, [{"role": "user", "content": prompt}], temperature=1.3)
+    if answer is None:
+        return '[]'
+    import re
     match = re.search(r'\[(.*?)\]', answer)
     if match:
         answer = match.group(0)

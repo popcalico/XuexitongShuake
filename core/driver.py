@@ -25,9 +25,14 @@ import zipfile
 import requests
 
 from core import paths
+from core import subproc
 
 DRIVER_NAMES = {'edge': 'msedgedriver', 'chrome': 'chromedriver'}
 BROWSER_LABELS = {'edge': 'Microsoft Edge', 'chrome': 'Google Chrome'}
+
+# 驱动版本缓存：`pick()` 会对每个候选驱动逐个问版本，没缓存时同一个
+# 可执行文件会被反复执行 `--version`（每执行一次就闪一个控制台黑窗）。
+_DRIVER_VERSION_CACHE = {}
 
 # Edge 驱动的官方下载源（国内一般可达，azureedge 作为备用）
 EDGE_URLS = (
@@ -113,8 +118,8 @@ def _unix_version(browser: str):
         if not exe:
             continue
         try:
-            out = subprocess.run([exe, '--version'], capture_output=True,
-                                 text=True, timeout=8).stdout
+            out = subproc.run_hidden([exe, '--version'], capture_output=True,
+                                     text=True, timeout=8).stdout
         except Exception:
             continue
         for token in reversed((out or '').strip().split()):
@@ -163,19 +168,32 @@ def _version_from_path(driver_path: str):
 
 
 def driver_version(driver_path: str):
-    """驱动自己的版本：先看路径里的版本目录，再问驱动本身。"""
+    """驱动自己的版本：先看路径里的版本目录，再问驱动本身。
+
+    走 `subproc.run_hidden`：驱动是控制台程序，GUI 进程直接调它会弹黑窗。
+    """
     version = _version_from_path(driver_path)
     if version:
         return version
     try:
-        out = subprocess.run([driver_path, '--version'], capture_output=True,
-                             text=True, timeout=8).stdout
+        key = os.path.normcase(os.path.abspath(driver_path))
     except Exception:
+        key = str(driver_path)
+    if key in _DRIVER_VERSION_CACHE:
+        return _DRIVER_VERSION_CACHE[key]
+    try:
+        out = subproc.run_hidden([driver_path, '--version'], capture_output=True,
+                                 text=True, timeout=8).stdout
+    except Exception:
+        _DRIVER_VERSION_CACHE[key] = None
         return None
+    found = None
     for token in reversed((out or '').strip().split()):
         if token[:1].isdigit() and '.' in token:
-            return token.strip('vV')
-    return None
+            found = token.strip('vV')
+            break
+    _DRIVER_VERSION_CACHE[key] = found
+    return found
 
 
 def _major(version) -> str:

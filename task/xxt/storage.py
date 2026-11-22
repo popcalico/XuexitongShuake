@@ -18,6 +18,12 @@ from typing import Any, Dict, Optional
 from .crypto import aes_decrypt, aes_encrypt
 
 from core import paths
+try:
+    from core import credential_store as _secrets
+except Exception:
+    _secrets = None
+
+_COOKIE_REF = 'secret_ref:sign.cookies'
 
 # 签到数据同样放进可写数据目录（打包后 exe 旁边是只读的）。
 # 用 paths.data（跟随 HOME/XXT_HOME）而不是 root_data：多账号签到各跑一个子进程，
@@ -57,22 +63,51 @@ def _write_json(name: str, data: Any) -> None:
 # 登录信息
 # ---------------------------------------------------------------------------
 def load_config() -> Dict[str, Any]:
-    return _read_json(CONFIG_FILE, {}) or {}
+    cfg = _read_json(CONFIG_FILE, {}) or {}
+    # 任务03：Cookie 以 DPAPI 引用落盘，读取时还原；绝不把明文 Cookie 留在 JSON。
+    raw = cfg.get('cookies', '')
+    if isinstance(raw, str) and raw.startswith(_COOKIE_REF) and _secrets:
+        try:
+            cfg['cookies'] = _secrets.load_secret('sign.cookies', '')
+        except Exception:
+            cfg['cookies'] = ''
+    elif raw and not str(raw).startswith(_COOKIE_REF) and _secrets:
+        # 旧配置迁移：明文 Cookie -> 加密入库 -> 回读验证 -> 换引用
+        try:
+            _secrets.save_secret('sign.cookies', raw)
+            if _secrets.load_secret('sign.cookies', None) == raw:
+                cfg['cookies'] = _COOKIE_REF + 'sign.cookies'
+                _write_json(CONFIG_FILE, cfg)
+        except Exception:
+            pass
+    return cfg
 
 
 def save_config(username: str, password: str, uid: str, fid: str,
                 cookies: str, real_name: str = "") -> Dict[str, Any]:
-    """保存登录信息(密码 AES 加密), 供下次免输入登录"""
+    """保存登录信息(密码 AES 加密, Cookie DPAPI 加密), 供下次免输入登录"""
+    disk_cookies = cookies
+    if cookies and _secrets:
+        try:
+            _secrets.save_secret('sign.cookies', cookies)   # 失败时下面拒绝写明文
+            disk_cookies = _COOKIE_REF + 'sign.cookies'
+        except Exception:
+            # DPAPI 失败：绝不降级写明文 Cookie；留空并要求重新登录
+            disk_cookies = ''
+    elif cookies and not _secrets:
+        disk_cookies = ''
     cfg = {
         "username": username,
         "password": aes_encrypt(password) if password else "",
         "uid": str(uid),
         "fid": str(fid),
-        "cookies": cookies,
+        "cookies": disk_cookies,
         "real_name": real_name or "",
         "login_ts": int(time.time() * 1000),
     }
     _write_json(CONFIG_FILE, cfg)
+    # 返回内存态用明文 Cookie 供本次会话继续用
+    cfg['cookies'] = cookies
     return cfg
 
 

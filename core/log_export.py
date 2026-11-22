@@ -94,6 +94,21 @@ def _safe(name: str) -> str:
     return re.sub(r'[^0-9A-Za-z_.-]', '_', str(name)) or 'default'
 
 
+def _prune_walk(folder: str, dirs: list) -> bool:
+    """日志包遍历时剪掉 DOM 快照目录。
+
+    2026-11-19：DOM 快照里每个 meta.json 都会被「全部 JSON」那一步当成配置收进去，
+    还会被脱敏改名，纯属噪音；而 html 动辄几百 MB，绝不能进日志包。
+    DOM 只保留在本地 record/DOM 供离线分析，导出包只列清单。
+    """
+    base = os.path.basename(folder).upper()
+    parent = os.path.basename(os.path.dirname(folder)).lower()
+    if base == 'DOM' and parent == 'record':
+        dirs[:] = []
+        return True
+    return False
+
+
 def _extract_day(line: str):
     m = _DAY_RE.search(line or '')
     if not m:
@@ -137,6 +152,20 @@ def sanitize(text: str) -> str:
         text)
     text = _PHONE_RE.sub(lambda m: '*******' + m.group(0)[-4:], text)
     text = _API_KEY_RE.sub(lambda m: m.group(1)[:3] + '***', text)
+    # MeoW 设备 URL 里的昵称是凭据：配置字段和正文中出现的裸 URL 都要打码
+    text = re.sub(r'("meow_url"\s*:\s*)"[^"]*"', r'\1"***"', text, flags=re.I)
+    text = re.sub(r'(api\.chuckfang\.com/)[A-Za-z0-9_\-]{4,}',
+                  r'\1***', text, flags=re.I)
+    # OpenAI 兼容接口允许任意格式的 Key（不一定以 sk- 开头），
+    # 用导出前从配置注册的明文做精确替换，避免漏打码。
+    try:
+        from core import ai_config
+        for secret in ai_config.extra_secrets():
+            pattern = ai_config.secret_pattern(secret)
+            if pattern:
+                text = pattern.sub('***', text)
+    except Exception:
+        pass
     return text
 
 
@@ -278,7 +307,9 @@ def _collect(data_root: str, day_str: str, with_question_shots: bool):
                          'run/%s/%s%s' % (acc, src_name, suffix))
 
     # 3) 全部 JSON 配置 / 状态：当前快照，脱敏后纳入
-    for folder, _dirs, files in os.walk(data_root):
+    for folder, dirs, files in os.walk(data_root):
+        if _prune_walk(folder, dirs):
+            continue
         if '__pycache__' in folder or os.path.basename(folder).startswith('.'):
             continue
         for name in files:
@@ -293,7 +324,9 @@ def _collect(data_root: str, day_str: str, with_question_shots: bool):
     #    原始文件名是中文课程名，包内改成 <账号>/study_01.txt / score_01.txt，
     #    原名与包内名的对应关系写在 README 对照表里。
     record_files = []
-    for folder, _dirs, files in os.walk(data_root):
+    for folder, dirs, files in os.walk(data_root):
+        if _prune_walk(folder, dirs):
+            continue
         if '__pycache__' in folder or os.path.basename(folder).startswith('.'):
             continue
         for name in files:
@@ -470,6 +503,24 @@ def export_day_logs(day=None, out_dir=None, data_root=None,
     day_str = day_obj.strftime('%Y-%m-%d')
     result['day'] = day_str
     root = os.path.abspath(data_root or paths.DATA_ROOT)
+    # 把本机配置里的 API Key 注册为额外脱敏词：OpenAI 兼容接口允许任意格式，
+    # 不能只靠 sk- 前缀正则。纯桩测试传临时目录时读不到配置，静默跳过即可。
+    try:
+        import json
+        from core import ai_config
+        for rel in (('tool', 'accounts.json'), ('tool', 'account_info.json')):
+            cfg_path = os.path.join(root, *rel)
+            if not os.path.isfile(cfg_path):
+                continue
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            candidates = [cfg.get('API'), (cfg.get('global') or {}).get('API')]
+            for acc in (cfg.get('accounts') or []):
+                candidates.append(acc.get('API'))
+            for value in candidates:
+                ai_config.register_secret(value)
+    except Exception:
+        pass
     target_dir = os.path.abspath(out_dir or default_out_dir())
     try:
         os.makedirs(target_dir, exist_ok=True)

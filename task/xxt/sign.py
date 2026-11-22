@@ -28,6 +28,39 @@ MIN_STEP = 1e-8
 _DISTANCE_RE = re.compile(r"距[^0-9]{0,12}?([\d.]+(?:[eE][+-]?\d+)?)\s*米")
 
 
+class _RequestBudget:
+    """单次位置签到的统一请求预算（2026-11-16 任务09）。
+
+    MAX_ROUNDS / MAX_WALK 只管「轮数 / 步长」，最坏可达 2000+ 次请求。
+    这里叠加独立的全局次数预算 + 总时间预算 + stop_event 取消：
+    每次发请求前调用 can_spend()，超预算立即停止搜索。
+    """
+
+    def __init__(self, stop_event=None,
+                 max_requests=None, time_budget=None):
+        self.stop_event = stop_event
+        self.max_requests = int(max_requests or constants.LOCATION_MAX_TOTAL_REQUESTS)
+        self.time_budget = float(time_budget or constants.LOCATION_TIME_BUDGET)
+        self.started = time.time()
+        self.spent = 0
+        self.reason = ''
+
+    def can_spend(self):
+        if self.stop_event is not None and getattr(self.stop_event, 'is_set', lambda: False)():
+            self.reason = '用户停止'
+            return False
+        if self.spent >= self.max_requests:
+            self.reason = '请求次数达到上限 %d' % self.max_requests
+            return False
+        if time.time() - self.started >= self.time_budget:
+            self.reason = '总时间预算 %.0f 秒耗尽' % self.time_budget
+            return False
+        return True
+
+    def spend(self):
+        self.spent += 1
+
+
 class SignResult:
     def __init__(self, success: bool, message: str = "", raw: str = "",
                  distance: Optional[float] = None, already: bool = False,
@@ -64,7 +97,12 @@ class SignResult:
     @staticmethod
     def parse(body: str) -> "SignResult":
         b = (body or "").strip()
-        if b == "success" or "签到成功" in b or "成功" in b:
+        # 否定词先行：旧实现 `"成功" in b` 排在所有失败判定之前，
+        # 「签到已结束，本次未成功」「操作不成功」都会被判成功并永久 mark_signed，
+        # 用户从此不再重试 → 直接错过签到（2026-11-19 审计 P0-10）。
+        negative = ("未成功", "不成功", "失败", "未签到", "error", "Error", "ERROR")
+        if b == "success" or (("签到成功" in b or "成功" in b)
+                              and not any(word in b for word in negative)):
             return SignResult(True, "签到成功", b)
         if "已签到" in b:
             return SignResult(False, "已签到过了", b, already=True)
@@ -208,7 +246,24 @@ def _resolve_candidates(client: XXTClient, act: Activity,
 
 
 def location_sign(client: XXTClient, act: Activity,
-                  info: Optional[Dict] = None) -> SignResult:
+                  info: Optional[Dict] = None, stop_event=None,
+                  max_requests=None, time_budget=None) -> SignResult:
+    """位置签到（任务09：统一请求预算 + 用户取消 + 总时间预算）。
+
+    stop_event：threading.Event，set 后立即停止自动定位；
+    max_requests/time_budget：覆盖默认预算（便于测试与特殊场景）。
+    """
+    budget = _RequestBudget(stop_event, max_requests, time_budget)
+
+    def submit_budgeted(la, lo):
+        """发请求前统一检查预算；超限返回带 budget 原因的失败结果。"""
+        if not budget.can_spend():
+            r = SignResult(False, "位置修正停止：%s" % budget.reason)
+            r.budget_exhausted = True
+            return r
+        budget.spend()
+        return submit_once(client, act, la, lo, address)
+
     info = info if info is not None else activity_mod.fetch_activity_info(client, act.aid)
     content = activity_mod.activity_content(client, act.aid, cached=info)
     address = activity_mod.content_address(content)
@@ -223,7 +278,9 @@ def location_sign(client: XXTClient, act: Activity,
     auth_errors = 0
     for lat, lon, label in candidates:
         time.sleep(constants.REQUEST_INTERVAL)
-        res = submit_once(client, act, lat, lon, address)
+        res = submit_budgeted(lat, lon)
+        if getattr(res, 'budget_exhausted', False):
+            return res
         last = res
         if res.is_ok():
             if res.success or res.already:     # 已进入有效范围, 记住这个位置
@@ -252,17 +309,30 @@ def location_sign(client: XXTClient, act: Activity,
     step = INIT_STEP
 
     def probe(la, lo):
+        if not budget.can_spend():
+            # 预算耗尽/用户停止：返回 (None, 失败结果) 让调用点终止循环
+            r = SignResult(False, "位置修正停止：%s" % budget.reason)
+            r.budget_exhausted = True
+            return None, r
         time.sleep(constants.REQUEST_INTERVAL)
-        r = submit_once(client, act, la, lo, address)
+        r = submit_budgeted(la, lo)
+        if getattr(r, 'budget_exhausted', False):
+            return None, r
         if r.is_ok():
             if r.success or r.already:
                 storage.save_cached_coord(address, la, lo)
             return r.distance, r
+        # 遇到验证码/人脸/拍照/锁定：停止自动操作，交还人工处理
         if r.need_captcha or r.need_face or r.need_photo or r.locked or r.auth_error:
             return r.distance, r
         return r.distance, None
 
     for _round in range(MAX_ROUNDS):
+        # 每轮开始检查总预算（任务09）：确保任何路径耗尽都能透传停止原因
+        if not budget.can_spend():
+            r = SignResult(False, "位置修正停止：%s" % budget.reason)
+            r.budget_exhausted = True
+            return r
         improved = False
         for axis in ("lat", "lon"):
             dirs = {}
@@ -314,12 +384,13 @@ sign_txt =None
 # ===========================================================================
 # 分发
 # ===========================================================================
-def sign_activity(client: XXTClient, act: Activity,sign_text) -> SignResult:
+def sign_activity(client: XXTClient, act: Activity, sign_text,
+                  stop_event=None) -> SignResult:
     global sign_txt
     sign_txt = sign_text
     storage.log("发现签到: [%s] %s (%s) aid=%s"
                 % (act.sign_type_text, act.name, act.course.title, act.aid),sign_text=sign_text)
     pre_sign(client, act)
     if act.other_id == constants.SIGN_LOCATION:
-        return location_sign(client, act)
+        return location_sign(client, act, stop_event=stop_event)
     return normal_sign(client, act)

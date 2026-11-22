@@ -21,7 +21,9 @@ import sys
 import io
 from task.tool.ai_wen_da import main
 from task.tool.DeepSeekAsk import DeepSeekAsk, DeepSeekAskImage
+from core import ai_config
 from task.tool.send_wx import send_error
+from core import runtime
 from task.tool import quota
 from core import paths
 from core import browser as browser_ext
@@ -221,7 +223,51 @@ def _parse_finish_ratio(value):
     return value
 
 
+# 提交确认弹窗兜底：确认按钮没有稳定 id/class 时按文字点（严格相等，避免误点）
+_POPUP_OK_BY_TEXT_JS = r"""
+const texts = ['确定', '确认', '提交', '是'];
+for (const t of texts) {
+  for (const node of document.querySelectorAll('a,button,span,div')) {
+    if (node.offsetParent === null) { continue; }
+    const s = (node.textContent || '').replace(/\s+/g, '');
+    if (s === t) { node.click(); return t; }
+  }
+}
+return '';
+"""
+
+# 中文题型 -> 缓存里用的编码（与 ai_wen_da.main 的 typ_dict 保持一致）
+QUIZ_TYPE_CODES = {'单选题': '0', '多选题': '1', '填空题': '2', '判断题': '3',
+                   '简答题': '9', '论述题': '9', '名词解释': '9'}
+
+# 提交后结果页：按题块收集 class 与文本，用于判断这一题平台判对还是判错。
+# 各校/各版本页面结构差异很大，这里只做「宽收集」，判定放在 Python 里，
+# 且**数量对不上就整体放弃**——错位的缓存比没有缓存危害大得多。
+_HARVEST_RESULT_JS = r"""
+const blocks = document.querySelectorAll(
+  '.questionLi, .TiMu, [class*="questionLi"], .mark_item, .answerList .item');
+const out = [];
+for (const b of blocks) {
+  let cls = String(b.className || '');
+  const nodes = b.querySelectorAll('*');
+  for (let i = 0; i < nodes.length && i < 60; i++) {
+    cls += ' ' + String(nodes[i].className || '');
+  }
+  out.push({
+    cls: cls.slice(0, 600),
+    text: String(b.innerText || '').replace(/\s+/g, '').slice(0, 300)
+  });
+}
+return out;
+"""
+
+
 class Answer:
+    # 复习模式绝不作用于测验/作业：重做会覆盖已有成绩。
+    # 本类不继承 Common，写在这里是为了让「哪些类型参与复习」有一处可查，
+    # 也防止以后被改成继承 Common 时意外被重刷。
+    REVIEWABLE = False
+
     def __init__(self, driver, test_frame, course_name, api,work_choice,after_finish_question,times=0,
                  frame_selector=None):
         self.driver=driver
@@ -250,6 +296,18 @@ class Answer:
         self.image_questions = set()   # 题干或选项是图片的题号，改用多模态识别
         self.image_unanswered = set()  # 多模态也没答出来的图片题，最后统一提示
         self.skipped_questions = set() # 程序答不了的题型（计算/简答/填空…）：不联网、不点选项
+        # 主观题本应答上却没答成（无答案 / 写入失败）。提交不可逆，据此拦截自动提交。
+        self.unanswered_subjective = set()
+        # 反向白名单：只有 _write_answer 回读确认「答案真的在作答区里」才登记。
+        # submit() 要求本场每道主观题都在这个集合里，防止「看着 7/7 其实交白卷」。
+        self.subjective_written = set()
+        # 「AI 尽力完成」模式下被放行、准备走 AI 作答的题号（默认策略）
+        self.needs_ai_questions = set()
+        # 提交结果：'' 未提交 / 'submitted' 平台明确提示成功 /
+        #           'unknown' 点了提交但平台没给任何提示 / 'saved' 只保存了 / 'failed' 被平台拒绝
+        # 上层 `Quiz.verify_finished()` 用它区分「真的交上去了」和「只是点了没反应」
+        # （2026-11-19：测验常常不打任务点勾，只看 ans-job-finished 会把成功判成失败）。
+        self.submit_state = ''
         self.times = times
         if self.work_choice is not None:
             self.main()
@@ -322,19 +380,20 @@ class Answer:
             print(color.yellow(f'测验未标记完成（{reason or "没有找到状态标记"}），开始作答'), flush=True)
             self.get_title_option()
             print(color.red('正在搜索中，请耐心等待...'))
-            if self.API_KEY=='sk-open_deepseek':
-                self.no_answer_dit = {k: v for k, v in self.all_title_dit.items()
-                                      if k not in self.image_questions
-                                      and k not in self.skipped_questions
-                                      and self.questionType_list[k] not in self.UNANSWERABLE_TYPES}
-            else:
-                self.use_ai_wen_da()
+            has_ai = ai_config.is_key_valid(self.API_KEY)
+            # 题库查询与「有没有配 AI Key」无关：未配 Key 只意味着没有 AI 兜底，
+            # 不代表可以跳过题库。旧实现把哨兵 Key 分支直接建成「全部无答案」，
+            # 于是没填 Key 的用户整场测验都不会查题库，必然空答（审计 P1）。
+            self.use_ai_wen_da()
+            if has_ai:
                 for i, answer in self.num_answer_dit.items():
                     if (not answer and i not in self.image_questions
                             and i not in self.skipped_questions
                             and self.questionType_list[i] not in self.UNANSWERABLE_TYPES):
                         self.no_answer_dit[i] = self.all_title_dit[i]
-            self.use_deepseek()
+                self.use_deepseek()
+            else:
+                print(color.yellow('未配置有效的 AI Key：本轮只用题库作答，不做 AI 兜底'), flush=True)
             # 查答案期间页面可能重渲染/跳转，答题前统一把上下文切回来
             turn_page(self.driver, '学生学习页面')
             if not self._enter_context():
@@ -349,6 +408,10 @@ class Answer:
             for title_num in self.num_answer_dit.keys():
                 if self.finish_title(title_num):
                     self.reword_time += 1
+                else:
+                    # 兜底：任何没答成的主观题都登记，submit() 据此拒绝自动提交。
+                    # 覆盖 AI 未答出 / 写入失败 / 定位失败 / 答题异常 全部失败路径。
+                    self._mark_subjective_unanswered(title_num)
                 time.sleep(1)
             if self.skipped_questions:
                 nums = '、'.join(str(i + 1) for i in sorted(self.skipped_questions))
@@ -455,12 +518,17 @@ class Answer:
                     self._mark_image_question(i, self.title_and_option_element)
                     print(color.yellow(f'第{i+1}题：选项含无文字图片，改由多模态作答'), flush=True)
             elif self.question_kind(self.questionType) == 'essay':
-                # 主观题：程序写不了字，直接跳过，不查题库也不问 AI（省额度）
                 self.all_optionWebElementList.append(None)
                 self.option_text_list = ['']
-                self.skipped_questions.add(i)
-                print(color.yellow(f'第{i+1}题：{self.questionType}无法自动作答，跳过（不联网）'),
-                      flush=True)
+                if runtime.ai_effort_enabled():
+                    # 默认放行：题干已由 decodeSecret 解好，交给 AI 生成答案后走填写分支
+                    self._mark_needs_ai(i)
+                    print(color.yellow(f'第{i+1}题：{self.questionType}交给 AI 尽力完成'),
+                          flush=True)
+                else:
+                    self.skipped_questions.add(i)
+                    print(color.yellow(f'第{i+1}题：{self.questionType}无法自动作答，跳过（不联网）'),
+                          flush=True)
             else:
                 # 题型没解析出来（题干/整题是图片，或计算题这类非常规题）：
                 # 用「真实的选项数量」+「有没有作答编辑器」来判断——
@@ -469,10 +537,18 @@ class Answer:
                 if not self._can_answer_by_options(self.title_and_option_element):
                     self.all_optionWebElementList.append(None)
                     self.option_text_list = ['']
-                    self.skipped_questions.add(i)
+                    # 无论哪种策略都留一张截图，方便真机核对
                     self._save_image_question(i, self.title_and_option_element)
-                    print(color.yellow(f'第{i+1}题无作答选项（{self.questionType or "题型未知"}），'
-                                       f'已跳过（只截图，不调 AI）'), flush=True)
+                    if runtime.ai_effort_enabled() and self._has_rich_editor(
+                            self.title_and_option_element):
+                        # 有作答区（填空/简答富文本）才放行，计算题/连线题仍跳过
+                        self._mark_needs_ai(i)
+                        print(color.yellow(f'第{i+1}题无选项但有作答区，交给 AI 尽力完成'),
+                              flush=True)
+                    else:
+                        self.skipped_questions.add(i)
+                        print(color.yellow(f'第{i+1}题无作答选项（{self.questionType or "题型未知"}），'
+                                           f'已跳过（截图留档，不调 AI）'), flush=True)
                 else:
                     options = self.title_and_option_element.find_elements(By.TAG_NAME, 'li')
                     self.all_optionWebElementList.append(options)
@@ -603,8 +679,8 @@ class Answer:
 
     def _ask_image_question(self, title_num, question):
         """把整题截图交给多模态模型，返回选项下标列表；失败返回 []。"""
-        if not self.API_KEY or self.API_KEY == 'sk-open_deepseek' or 'sk-' not in self.API_KEY:
-            print(color.yellow(f'第{title_num + 1}题为图片题，未配置 API Key，无法识图'), flush=True)
+        if not ai_config.is_key_valid(self.API_KEY):
+            print(color.yellow(f'第{title_num + 1}题为图片题，未配置有效的 API Key，无法识图'), flush=True)
             return []
         path = self._save_image_question(title_num, question)
         if not path:
@@ -670,10 +746,31 @@ class Answer:
         return _as_answer_list(raw)
 
     def use_ai_wen_da(self):
+        needs_ai = getattr(self, 'needs_ai_questions', set())
         for i in self.all_title_dit.keys():
             if i in self.image_questions:
                 # 图片题没有可检索的文本，查题库纯属浪费请求
                 self.num_answer_dit[i] = []
+                continue
+            if (i in needs_ai and runtime.ai_effort_enabled()
+                    and ai_config.is_key_valid(self.API_KEY)):
+                # 放行模式：题库对填空/简答会直接跳过，这里逐题问 AI 更可靠。
+                # AI 没答出来就自动降级成「截图跳过」，不卡住整场测验。
+                # 未配有效 Key 时这个分支不会进（否则每题都白跑一次失败请求），
+                # 直接落到下面的题库搜索路径。
+                try:
+                    answers = self._ask_one(i)
+                except Exception as e:
+                    answers = []
+                    print(color.red(f'第{i+1}题 AI 作答异常：{e}'), flush=True)
+                if answers:
+                    self.num_answer_dit[i] = answers
+                    print(color.green(f'第{i+1}题 AI 已给出答案：{answers}'), flush=True)
+                else:
+                    self.num_answer_dit[i] = []
+                    needs_ai.discard(i)
+                    self.skipped_questions.add(i)
+                    print(color.yellow(f'第{i+1}题 AI 未答出，已降级为截图跳过'), flush=True)
                 continue
             if i in self.skipped_questions or self.questionType_list[i] in self.UNANSWERABLE_TYPES:
                 # 简答/论述/填空/名词解释/计算等程序答不了的题：直接跳过，不去联网（省额度）
@@ -714,7 +811,20 @@ class Answer:
                                f'{self.MAX_AI_BATCH} 道，其余先跳过'), flush=True)
             keys = keys[:self.MAX_AI_BATCH]
 
-        print(color.red('正在使用deepseek搜题，请耐心等待...'), flush=True)
+        # 打印清楚「是为哪几道题问的」：否则日志紧跟在某道**缓存命中**的题后面，
+        # 看起来像是「明明有缓存还去问 AI」（2026-11-19 用户反馈的误解点）。
+        title_map = getattr(self, 'all_title_dit', None) or {}
+        briefs = []
+        for key in keys[:5]:
+            try:
+                briefs.append('第%s题「%s」' % (key + 1, str(title_map.get(key, ''))[:16]))
+            except Exception:
+                briefs.append(str(key))
+        brief = '、'.join(briefs)
+        if len(keys) > 5:
+            brief += ' 等 %d 道' % len(keys)
+        print(color.red(f'正在使用deepseek搜题（题库未命中的 {len(keys)} 道：{brief}），'
+                        f'请耐心等待...'), flush=True)
         title = ''.join(self.no_answer_dit[key] for key in keys)
         answers = DeepSeekAsk(self.API_KEY, title, 'all')
         parts = self._split_batch_answer(answers, len(keys))
@@ -750,11 +860,280 @@ class Answer:
             return None
         return parts
 
+    @staticmethod
+    def _answer_to_text(answer):
+        """AI / 题库返回的答案可能是列表或字符串，统一成可填入的文本。"""
+        if isinstance(answer, (list, tuple)):
+            return '\n'.join(str(x) for x in answer if x is not None)
+        return '' if answer is None else str(answer)
+
+    def _sync_editor(self, el):
+        """写入后触发同步：UEditor 一类富文本编辑器把内容放在 iframe 里，
+        必须触发 input/change/blur（或 UE.instants[*].sync()）才会写回表单隐藏字段，
+        否则页面看着有字、平台提交时读到的仍是空值 —— 这正是「交白卷」的成因之一。
+        """
+        try:
+            self.driver.execute_script(
+                "var el=arguments[0];"
+                "try{el.dispatchEvent(new Event('input',{bubbles:true}));}catch(e){}"
+                "try{el.dispatchEvent(new Event('change',{bubbles:true}));}catch(e){}"
+                "try{if(el.blur)el.blur();}catch(e){}"
+                "try{if(window.UE&&UE.instants){for(var k in UE.instants)"
+                "{try{UE.instants[k].sync();}catch(e){}}}}catch(e){}", el)
+        except Exception:
+            pass
+
+    def _write_answer(self, question_element, blank_index, text):
+        """往第 blank_index 个作答区写文本；**回读确认真的写进去了**才返回 True。
+
+        学习通不同版式用 textarea / contenteditable / ueditor iframe / wangEditor。
+        旧实现 `send_keys` 之后无条件 return True，且 iframe 分支只要节点里有
+        任意文本（可能是题干/占位符）就当成「已有答案」直接返回 —— 结果简答题
+        页面上其实空着，程序却计入答题率，达到阈值后自动提交，空答案不可逆。
+        这里改成写入后回读比对，任何一种写进去且内容匹配才算成功。
+        """
+        value = str(text or '').strip()
+        if not value:
+            return False
+
+        def looks_written(current):
+            a = re.sub(r'\s+', '', str(current or ''))
+            b = re.sub(r'\s+', '', value)
+            return bool(b) and b in a
+
+        def read_back(el):
+            try:
+                current = el.get_attribute('value')
+            except Exception:
+                current = ''
+            if not current:
+                try:
+                    current = self.driver.execute_script(
+                        'return arguments[0].innerText || arguments[0].textContent || "";', el)
+                except Exception:
+                    current = ''
+            return current
+
+        for by, selector in ((By.CSS_SELECTOR, 'textarea'),
+                             (By.CSS_SELECTOR, '[contenteditable="true"]')):
+            try:
+                elements = question_element.find_elements(by, selector)
+                if blank_index >= len(elements):
+                    continue
+                el = elements[blank_index]
+                try:
+                    el.click()
+                except Exception:
+                    self.driver.execute_script('arguments[0].click();', el)
+                try:
+                    self.driver.execute_script("arguments[0].value = '';", el)
+                except Exception:
+                    pass
+                el.send_keys(value)
+                self._sync_editor(el)
+                if looks_written(read_back(el)):
+                    return True
+            except Exception:
+                continue
+
+        entered = False
+        try:
+            frames = question_element.find_elements(By.TAG_NAME, 'iframe')
+            if blank_index < len(frames):
+                self.driver.switch_to.frame(frames[blank_index])
+                entered = True
+                nodes = self.driver.find_elements(By.TAG_NAME, 'p')
+                if not nodes:
+                    nodes = self.driver.find_elements(
+                        By.CSS_SELECTOR, '[contenteditable="true"], body')
+                if nodes:
+                    node = nodes[0]
+                    # 无论节点里原来有什么（题干 / 占位符 / 上一题残留），一律清空重写；
+                    # 旧实现「节点里有任意文本就 return True」是白卷的根因之一。
+                    try:
+                        self.driver.execute_script("arguments[0].innerHTML = '';", node)
+                    except Exception:
+                        pass
+                    try:
+                        node.click()
+                    except Exception:
+                        self.driver.execute_script('arguments[0].click();', node)
+                    node.send_keys(value)
+                    self._sync_editor(node)
+                    if looks_written(read_back(node)):
+                        return True
+        except Exception:
+            pass
+        finally:
+            if entered:
+                try:
+                    self.driver.switch_to.parent_frame()
+                except Exception:
+                    pass
+        return False
+
+    def _mark_needs_ai(self, i):
+        """登记一道放行题；兼容纯桩测试用 object.__new__ 造的实例。"""
+        if not hasattr(self, 'needs_ai_questions'):
+            self.needs_ai_questions = set()
+        self.needs_ai_questions.add(i)
+
+    def _blank_elements(self, key):
+        """返回该题的空位元素列表（按 DOM 顺序）。
+
+        学习通填空题的空位是 InpDIV（作业页是 edui iframeholder），
+        必须**先点击空位**才会展开/激活对应的编辑器；不能只在题目里按索引找 iframe，
+        否则多个答案会追加进同一个框（2026-11-06 真机截图确认）。
+        """
+        try:
+            q = self.questionList0[key]
+        except Exception:
+            return []
+        for by, selector in (
+                (By.CLASS_NAME, 'InpDIV'),
+                (By.CSS_SELECTOR, '[class="edui-editor-iframeholder edui-default"]'),
+                (By.CSS_SELECTOR, '[contenteditable="true"]'),
+                (By.CSS_SELECTOR, 'textarea')):
+            try:
+                elements = q.find_elements(by, selector)
+                if elements:
+                    return elements
+            except Exception:
+                continue
+        return []
+
+    def _blank_frames(self, key):
+        """题目里的 iframe 列表，作为「空位内找不到编辑器」时的回退。"""
+        try:
+            return self.questionList0[key].find_elements(By.TAG_NAME, 'iframe')
+        except Exception:
+            return []
+
+    def _editor_has_text(self, node, value):
+        """回读校验：写入的内容真的出现在节点里才算成功（2026-11-19 审计 P0-9）。
+
+        旧 `_fill_blank` 发完 send_keys 就无条件 return True：填空编辑器
+        readonly / 富文本未激活 / 节点不可编辑时，send_keys 不抛异常但内容
+        根本没进去，于是「已写入」被登记，白卷闸门直接放行。
+        """
+        try:
+            current = node.get_attribute('value')
+        except Exception:
+            current = ''
+        if not current:
+            try:
+                current = self.driver.execute_script(
+                    'return arguments[0].innerText || arguments[0].textContent || "";', node)
+            except Exception:
+                current = ''
+        a = re.sub(r'\s+', '', str(current or ''))
+        b = re.sub(r'\s+', '', str(value or ''))
+        return bool(b) and b in a
+
+    def _fill_blank(self, blank_el, text, frames, index):
+        """激活第 index 个空位并写入答案；**回读确认**后才返回 True。"""
+        try:
+            self.driver.execute_script("arguments[0].click();", blank_el)
+        except Exception:
+            try:
+                blank_el.click()
+            except Exception:
+                return False
+        value = str(text)
+        # 1) 空位内直接可编辑的节点
+        for by, selector in ((By.CSS_SELECTOR, 'textarea'),
+                             (By.CSS_SELECTOR, '[contenteditable="true"]')):
+            try:
+                nodes = blank_el.find_elements(by, selector)
+                if nodes:
+                    el = nodes[0]
+                    try:
+                        self.driver.execute_script("arguments[0].value = '';", el)
+                    except Exception:
+                        pass
+                    el.send_keys(value)
+                    if self._editor_has_text(el, value):
+                        return True
+                    continue
+            except Exception:
+                continue
+        # 2) iframe 编辑器：空位内优先，再从题目 iframe 列表的第 index 个往后找。
+        #    题目里常夹着公式/图片等无关 iframe，所以从 index 开始逐个试，
+        #    找到第一个含可编辑节点的才写，避免索引错位把答案串到同一个空。
+        candidates = []
+        try:
+            candidates += blank_el.find_elements(By.TAG_NAME, 'iframe')
+        except Exception:
+            pass
+        candidates += list(frames[index:])
+        for frame in candidates:
+            entered = False
+            try:
+                self.driver.switch_to.frame(frame)
+                entered = True
+                nodes = self.driver.find_elements(By.TAG_NAME, 'p')
+                if not nodes:
+                    nodes = self.driver.find_elements(
+                        By.CSS_SELECTOR, '[contenteditable="true"], body')
+                if not nodes:
+                    continue
+                node = nodes[0]
+                # 清空再写：不这么做会把多个答案追加成「生我者父母1210」
+                try:
+                    self.driver.execute_script("arguments[0].innerHTML = '';", node)
+                except Exception:
+                    pass
+                try:
+                    node.click()
+                except Exception:
+                    pass
+                node.send_keys(value)
+                if self._editor_has_text(node, value):
+                    return True
+                continue
+            except Exception:
+                continue
+            finally:
+                if entered:
+                    try:
+                        self.driver.switch_to.parent_frame()
+                    except Exception:
+                        pass
+        return False
+
+    def _count_blanks(self, key):
+        """数一道填空题有几个空位；数不出返回 0，调用方会降级为截图跳过。
+
+        学习通不同版式用 InpDIV / ueditor iframeholder / contenteditable / textarea，
+        这里按优先级逐个探测，不写死一种选择器。
+        """
+        try:
+            q = self.questionList0[key]
+        except Exception:
+            return 0
+        for by, value in (
+                (By.CLASS_NAME, 'InpDIV'),
+                (By.CSS_SELECTOR, '[class="edui-editor-iframeholder edui-default"]'),
+                (By.CSS_SELECTOR, '[contenteditable="true"]'),
+                (By.CSS_SELECTOR, 'textarea')):
+            try:
+                n = len(q.find_elements(by, value))
+                if n:
+                    return n
+            except Exception:
+                continue
+        return 0
+
     def _ask_one(self, key):
         """逐题问 AI，返回答案列表；失败返回 []。"""
         typ = self.questionType_list[key]
         options = self.num_option_dit[key] or []
         prompt = f'【{typ}】{self.only_title_text[key]}{options}'
+        if typ == '填空题':
+            blanks = self._count_blanks(key)
+            if blanks:
+                prompt += (f'\n本题共有 {blanks} 个空，请给出恰好 {blanks} 个答案，'
+                           f'按空位顺序放在列表里，不要合并成一个字符串。')
         try:
             raw = DeepSeekAsk(self.API_KEY, prompt, typ)
         except Exception as e:
@@ -1049,10 +1428,14 @@ class Answer:
             return False
         if title_num in self.image_questions:
             # 图片题（题干/选项是图片）：截图交给多模态模型，按返回的字母点选项
-            return self._finish_image_title(title_num)
+            ok = self._finish_image_title(title_num)
+            if not ok:
+                self._mark_subjective_unanswered(title_num)
+            return ok
         question = self._relocate(title_num)
         if question is None:
             print(color.red(f'第{title_num + 1}题定位失败，跳过'), flush=True)
+            self._mark_subjective_unanswered(title_num)
             return False
         try:
             # 滚动到题目
@@ -1104,58 +1487,86 @@ class Answer:
                     self._click_option(title_num, ans)
                 return True
 
-            elif self.questionType_list[title_num]=='简答题' or self.questionType_list[title_num]=='论述题' or self.questionType_list[title_num]=='名词解释':
-                text_frame=self.questionList0[title_num].find_element(By.TAG_NAME,'iframe')
-                self.driver.switch_to.frame(text_frame)
-                p_element=self.driver.find_element(By.TAG_NAME,'p')
-                check_answer = p_element.text
-                if check_answer != '':
-                    print(color.red('已回答，无需重复回答'), flush=True)
-                    self.driver.switch_to.parent_frame()
-                    return True
-                # self.driver.execute_script('arguments[0].innerText = arguments[1];', p_element, answer)
-                p_element.click()
-                p_element.send_keys(answer)
-                self.driver.switch_to.parent_frame()
-                return True
-            elif self.questionType_list[title_num]=='填空题':
-                if self.work_choice is not None:
-                    elements = self.questionList0[title_num].find_elements(By.CLASS_NAME, 'InpDIV')
-                else:
-                    elements = self.questionList0[title_num].find_elements(By.CSS_SELECTOR,
-                                                                           '[class="edui-editor-iframeholder edui-default"]')
-                text_frames = self.questionList0[title_num].find_elements(By.TAG_NAME, 'iframe')
-                if  len(answer)==1:
-                    answer=re.split(r' ', answer[0])
-                    print(color.red(f'修正答案：{answer}'), flush=True)
-                if len(elements)>len(answer):
-                    print(color.red('填空题答案数量少于题目数量'), flush=True)
+            elif self.questionType_list[title_num] in ('简答题', '论述题', '名词解释'):
+                text = self._answer_to_text(answer)
+                if not text.strip():
+                    print(color.red(f'第{title_num + 1}题没有可用答案，降级为截图跳过'), flush=True)
+                    self._mark_subjective_unanswered(title_num)
+                    self._save_image_question(title_num, self.questionList0[title_num])
                     return False
-                for number in range(len(elements)):
-                    self.driver.execute_script("arguments[0].click();", elements[number])
-                    self.driver.switch_to.frame(text_frames[number])
-                    p_element = self.driver.find_element(By.TAG_NAME, 'p')
-                    check_answer = p_element.text
-                    if check_answer != '':
-                        print(color.red('已回答，无需重复回答'), flush=True)
-                        self.driver.switch_to.parent_frame()
-                        continue
-                    try:
-                        p_element.click()
-                    except:
-                        self.driver.execute_script("arguments[0].click();", p_element)
-                    try:
-                        p_element.send_keys(answer[number])
-                    except:
-                        pass
-                    self.driver.switch_to.parent_frame()
-                    time.sleep(1)
+                if self._write_answer(self.questionList0[title_num], 0, text):
+                    self._mark_subjective_written(title_num)
+                    return True
+                print(color.red(f'第{title_num + 1}题作答区写入失败，降级为截图跳过'), flush=True)
+                self._mark_subjective_unanswered(title_num)
+                self._save_image_question(title_num, self.questionList0[title_num])
+                return False
+            elif self.questionType_list[title_num]=='填空题':
+                parts = ([str(x) for x in answer]
+                         if isinstance(answer, (list, tuple)) else [str(answer)])
+                blank_els = self._blank_elements(title_num)
+                blanks = len(blank_els)
+                frames = self._blank_frames(title_num)
+                # 只有「单个字符串 + 空位数 > 1 + 拆分后数量正好等于空位数」才拆。
+                # 否则「生我者父母，知我者鲍子也。」这类含中文逗号的正常答案
+                # 会被误拆，只填前半段（2026-11-06 真机截图确认的 bug）。
+                if (len(parts) == 1 and blanks > 1
+                        and (',' in parts[0] or '，' in parts[0])):
+                    split = [p.strip() for p in re.split(r'[,，]', parts[0]) if p.strip()]
+                    if len(split) == blanks:
+                        parts = split
+                if not blanks or len(parts) < blanks:
+                    print(color.red(f'第{title_num + 1}题数不出空位或答案不足'
+                                    f'（空位 {blanks} / 答案 {len(parts)}），降级为截图跳过'),
+                          flush=True)
+                    self._mark_subjective_unanswered(title_num)
+                    self._save_image_question(title_num, self.questionList0[title_num])
+                    return False
+                filled = 0
+                for number in range(blanks):
+                    # 点击空位可能让 DOM 变化，每轮重新取一次元素，避免 StaleElement
+                    fresh = self._blank_elements(title_num)
+                    if number >= len(fresh):
+                        break
+                    if self._fill_blank(fresh[number], parts[number], frames, number):
+                        filled += 1
+                    time.sleep(0.3)
+                if filled < blanks:
+                    # 旧实现只要 filled > 0 就登记「已写入」，3 个空只写进 1 个
+                    # 也算主观题已确认 → 提交闸门放行（审计 P0-9）。
+                    # 现在必须每个空都回读通过，否则按未完成处理（只保存不提交）。
+                    print(color.red(
+                        f'第{title_num + 1}题只写进 {filled}/{blanks} 个空，按未完成处理'),
+                        flush=True)
+                    self._mark_subjective_unanswered(title_num)
+                    if filled == 0:
+                        self._save_image_question(title_num, self.questionList0[title_num])
+                    return False
+                print(color.green(f'第{title_num + 1}题已填写 {filled}/{blanks} 个空'), flush=True)
+                self._mark_subjective_written(title_num)
                 return True
             else:
-                print(color.red(f'该题为{self.questionType}，暂时无法作答'), flush=True)
+                kind = ''
+                try:
+                    kind = self.questionType_list[title_num]
+                except Exception:
+                    kind = self.questionType or ''
+                print(color.red(f'第{title_num + 1}题（{kind}）暂时无法作答'), flush=True)
+                # 题型不在 ESSAY_TYPES（计算题 / "填空题（每空1分）" 等变体）但
+                # 题目里确实有作答编辑器：必须登记，否则闸门看不见它，
+                # 一个字没写也会被提交（2026-11-19 审计 P0-9）。
+                has_editor = False
+                try:
+                    has_editor = self._has_rich_editor(self.questionList0[title_num])
+                except Exception:
+                    has_editor = False
+                if has_editor:
+                    self._mark_subjective_unanswered(title_num, force=True)
                 return False
         except Exception as e:
             print(color.red(f'答题时出错了{e}'), flush=True)
+            # 异常同样会留下空答案：登记后 submit() 才不会把它交上去
+            self._mark_subjective_unanswered(title_num)
             return False
 
     def _work_button(self, selector):
@@ -1191,55 +1602,284 @@ class Answer:
                 break
         return False
 
+    def _mark_subjective_unanswered(self, title_num, force=False):
+        """登记一道没答成的主观题；客观题 / 未知题型默认不登记（避免误拦自动提交）。
+
+        force=True：题型不在 ESSAY_TYPES 但**题目里确实有作答编辑器**时强制登记
+        （计算题、"填空题（每空1分）"这类变体标签）。旧实现只看题型白名单，
+        这类题一个字没写也绕过了提交闸门（2026-11-19 审计 P0-9）。
+
+        兼容用 object.__new__ 造出来的旧测试桩：属性缺失时就地创建，绝不抛
+        AttributeError —— 那会让 finish_title 掉进 except，连降级截图都留不下。
+        """
+        if not force:
+            try:
+                kinds = self.questionType_list
+                if not (0 <= title_num < len(kinds)) or kinds[title_num] not in self.ESSAY_TYPES:
+                    return
+            except Exception:
+                return
+        bag = getattr(self, 'unanswered_subjective', None)
+        if bag is None:
+            bag = set()
+            self.unanswered_subjective = bag
+        bag.add(title_num)
+
+    def _mark_subjective_written(self, title_num):
+        """只有 _write_answer 回读确认「答案真的在作答区里」才登记；兼容 __new__ 旧桩。"""
+        bag = getattr(self, 'subjective_written', None)
+        if bag is None:
+            bag = set()
+            self.subjective_written = bag
+        bag.add(title_num)
+
+    def _unanswered_subjective_numbers(self):
+        """仍未作答的主观题题号（0-based）。
+
+        两个来源：① 主观题本应答上却没答成（无 AI 答案 / 作答区写入失败 /
+        定位失败 / 答题过程异常）；② 被整体跳过的主观题。计算题/连线题这类
+        程序本来就答不了的题不计入，否则会让自动提交几乎永远不触发。
+        """
+        blocked = set(getattr(self, 'unanswered_subjective', ()) or ())
+        kinds = getattr(self, 'questionType_list', ()) or ()
+        for idx in (getattr(self, 'skipped_questions', ()) or ()):
+            if 0 <= idx < len(kinds) and kinds[idx] in self.ESSAY_TYPES:
+                blocked.add(idx)
+        return sorted(blocked)
+
+    def _save_only(self):
+        """只保存不提交；保存按钮找不到也不重答整场测验。"""
+        self.submit_state = 'saved'
+        print(color.yellow('3秒后保存'), flush=True)
+        time.sleep(3)
+        if not self._work_button('[class="btnSave workBtnIndex"]'):
+            print(color.red('未找到保存按钮，请手动保存'), flush=True)
+        return True
+
     def submit(self):
-        formatted_result = "{:.2%}".format(self.ans_rate)
+        formatted_result = "{:.2%}".format(self.ans_rate or 0)
         print(color.red(f'本次答题率为{formatted_result}'), flush=True)
         if image_viewer_is_open(self.driver):
             close_image_viewer(self.driver)
-        if self.after_finish_question=='仅自动保存':
-            print(color.yellow('3秒后保存'), flush=True)
-            time.sleep(3)
-            if not self._work_button('[class="btnSave workBtnIndex"]'):
-                # 保存按钮找不到时不要把整场测验重来一遍（重答代价太大），提示手动保存即可
-                print(color.red('未找到保存按钮，请手动保存'), flush=True)
-                return True
-        elif self.after_finish_question=='强制自动提交'  or self.work_choice =='随机答题' or self.ans_rate >= self.after_finish_question:
-            # 点击提交
+
+        # 提交不可逆，主观题两道硬闸（缺一不可）：
+        # ① 反向白名单：本场每道主观题都必须由 _write_answer 回读确认「答案真的
+        #    写进了作答区」。旧实现只统计「搜到/点到的题」，7 道全简答题即使一个字
+        #    都没写进去也会算出 7/7=100% 并自动交白卷
+        #    （2026-11-12 20:49 真机日志，另一台电脑的 26.11.12.1322）。
+        # ② 失败登记：无答案 / 写入失败 / 整题跳过 / 答题异常 / 定位失败。
+        # 「随机答题」与「强制自动提交」也必须过这两道闸。
+        kinds = getattr(self, 'questionType_list', ()) or ()
+        essay = {i for i, k in enumerate(kinds) if k in self.ESSAY_TYPES}
+        written = set(getattr(self, 'subjective_written', ()) or ())
+        unverified = essay - written
+        blocked = sorted(set(self._unanswered_subjective_numbers()) | unverified)
+        if blocked:
+            nums = '、'.join(str(i + 1) for i in blocked)
+            print(color.red(
+                f'还有 {len(blocked)} 道主观题未作答或未能确认答案已写入（第 {nums} 题）；'
+                f'提交后无法修改，本次改为「仅自动保存」，请你手动补答后再提交。'),
+                flush=True)
+            return self._save_only()
+
+        if self.after_finish_question == '仅自动保存':
+            return self._save_only()
+
+        try:
+            threshold_ok = float(self.ans_rate or 0) >= float(self.after_finish_question)
+        except (TypeError, ValueError):
+            # 阈值是「强制自动提交」这类字符串时不做数值比较
+            threshold_ok = False
+
+        if (self.after_finish_question == '强制自动提交'
+                or self.work_choice == '随机答题'
+                or threshold_ok):
             print(color.yellow('3秒后提交'), flush=True)
             time.sleep(3)
             if not self._work_button('[class="btnSubmit workBtnIndex"]'):
-                print(color.red('当前测验无法提交'), flush=True)
-                return True
+                # 旧实现直接 return True：既没提交也没保存，作答随页面一起丢掉，
+                # 上层还以为这场测验成功了（审计 D2）。改为落一次「保存」。
+                print(color.red('当前测验找不到提交按钮，改为仅保存'), flush=True)
+                return self._save_only()
             time.sleep(1)
             # 点击确认（弹窗在顶层文档里）
             self.driver.switch_to.default_content()
-            self._click_popup_ok()
+            state = self._click_popup_ok()
+            if state == 'failed':
+                # 有确认弹窗却点不动：此时提交并未发生，继续往下走只会得到
+                # 「查不到成绩 + 平台未确认完成」这种无法定性的结果。
+                print(color.red('提交确认按钮点不到（选择器失效或被遮挡），'
+                                '改为仅保存，请手动点提交'), flush=True)
+                self._dump_page('测验提交确认失败')
+                return self._save_only()
             time.sleep(2)
             try:
                 message = self.driver.find_element(By.ID, 'popcontent').text
             except Exception:
                 message = ''
             if message:
-                print(color.red(f'提交失败，原因：{message}'), flush=True)
-                self._click_popup_ok()
-                return False
+                # 旧实现把 #popcontent 的**任何**文本都当失败：平台提示「提交成功」
+                # 也会被判失败 → 整场重答并再次提交，最多 4 次（审计 D1）。
+                if any(k in message for k in ('成功', '已提交', '已完成', '提交完成')):
+                    self.submit_state = 'submitted'
+                    print(color.green(f'平台提示：{message}'), flush=True)
+                else:
+                    self.submit_state = 'failed'
+                    print(color.red(f'提交失败，原因：{message}'), flush=True)
+                    self._click_popup_ok()
+                    self._dump_page('测验提交被平台拒绝')
+                    return False
+            else:
+                self.submit_state = 'unknown'
+                print(color.yellow(f'平台未返回提交提示（确认按钮={state}），'
+                                   f'按已提交继续，若成绩异常请查看日志'), flush=True)
             self.save_score()
+            # 提交后如果结果页标了对错，把「答对」的答案固化进缓存（答错的不写）
+            self._harvest_correct_answers()
         else:
             print(color.yellow(f'答题率未达到提交要求{self.after_finish_question}'), flush=True)
-            print(color.yellow('3秒后保存'), flush=True)
-            time.sleep(3)
-            if not self._work_button('[class="btnSave workBtnIndex"]'):
-                print(color.red('未找到保存按钮，请手动保存'), flush=True)
-                return True
+            return self._save_only()
 
         return True
 
+    # 提交确认按钮的候选选择器（平台改版会换 id/class，多试几个）
+    POPUP_OK_SELECTORS = ('#popok', '.popok', 'a.pop_ok', '#popokbtn')
+
     def _click_popup_ok(self):
+        """点「提交」确认弹窗里的确定按钮。
+
+        返回值：
+          * `'clicked'` —— 点到了；
+          * `'none'`    —— 页面上没有确认弹窗（一键提交的平台），无需确认；
+          * `'failed'`  —— 有确认弹窗但点不动（选择器失效 / 被遮挡）。
+
+        2026-11-19：旧实现只试 `#popok` 且**不看结果**。点不到时静默继续，
+        后面既读不到成功提示也读不到成绩，最后由上层判「平台未确认完成」——
+        根本分不清到底是「平台没弹窗」还是「我们没点到」，这也是本次
+        「小测提交失败」无法定性的原因之一。
+        """
+        visible = False
+        for selector in self.POPUP_OK_SELECTORS:
+            try:
+                nodes = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                nodes = []
+            for node in nodes:
+                try:
+                    if not node.is_displayed():
+                        continue
+                except Exception:
+                    pass
+                visible = True
+                try:
+                    node.click()
+                    return 'clicked'
+                except Exception:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", node)
+                        return 'clicked'
+                    except Exception:
+                        continue
+        if visible:
+            return 'failed'
+        # 没有候选按钮时，先确认「确实存在确认弹窗容器」，再按文字点，
+        # 避免在没弹窗的页面上误点页面里的「提交」按钮（会导致重复提交）。
         try:
-            self.driver.find_element(By.XPATH, '//*[@id="popok"]').click()
-            return True
+            has_container = bool(self.driver.find_elements(By.ID, 'popcontent'))
         except Exception:
-            return False
+            has_container = False
+        if not has_container:
+            return 'none'
+        try:
+            hit = self.driver.execute_script(_POPUP_OK_BY_TEXT_JS)
+        except Exception:
+            hit = ''
+        return 'clicked' if hit else 'failed'
+
+    def _dump_page(self, tag):
+        """把当前页面结构落盘（顶层 + iframe），用于排查提交类问题；失败静默。"""
+        try:
+            from core import dom_dump
+            path = dom_dump.capture(self.driver, tag)
+            if path:
+                print(color.yellow(f'已保存页面结构：{path}'), flush=True)
+        except Exception:
+            pass
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    def _collect_result_blocks(self):
+        """在提交结果页采集题块；当前帧取不到时再进 `#iframe` 试一次。"""
+        for frame in (None, 'iframe'):
+            try:
+                if frame:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(frame)
+                blocks = self.driver.execute_script(_HARVEST_RESULT_JS) or []
+            except Exception:
+                blocks = []
+            if blocks:
+                return blocks
+        print(color.yellow('结果页没有识别到题块（可能是没有对错标记的页面）'), flush=True)
+        return []
+
+    def _harvest_correct_answers(self):
+        """提交后把「平台判定答对」的题写进缓存，答错的绝不写。
+
+        需求来源（2026-11-19）：部分测验的结果页会在每题后标出对错。答对说明我们
+        提交的答案与平台一致，可以放心固化，下次同题直接命中；答错若也写缓存，
+        以后同题会一直错下去，比没有缓存更糟。
+
+        三条安全约束（宁可少缓存，不可缓存错）：
+        1. **题块数量必须等于本次题目数**，否则整体放弃 —— 数量错位会把 A 题的答案
+           记到 B 题头上，而缓存一旦写错就是长期的；
+        2. 只认明确的「答对」标记（class 含 `dui` / 文本含「回答正确」），
+           认不出就当没有，不猜；
+        3. 只用本题**实际提交过**的答案回填（`num_answer_dit`），不从页面反推。
+        """
+        total = len(getattr(self, 'questionType_list', ()) or ())
+        if total == 0:
+            return
+        blocks = self._collect_result_blocks()
+        if not blocks:
+            return
+        if len(blocks) != total:
+            print(color.yellow(f'提交结果页识别到 {len(blocks)} 个题块、本次共 {total} 道，'
+                               f'数量对不上；为避免答案错位，本次不写缓存'), flush=True)
+            self._dump_page('测验结果块数量不符')
+            return
+        api = None
+        right = wrong = 0
+        for index, block in enumerate(blocks):
+            classes = str(block.get('cls', ''))
+            text = str(block.get('text', ''))
+            if ('cuo' in classes) or ('回答错误' in text) or ('答案错误' in text):
+                wrong += 1
+                continue
+            if not (('dui' in classes) or ('回答正确' in text) or ('答案正确' in text)):
+                wrong += 1
+                continue
+            answer = (getattr(self, 'num_answer_dit', {}) or {}).get(index) or []
+            if not answer:
+                continue
+            try:
+                if api is None:
+                    from task.tool.ai_wen_da import AnswerAPI, Question
+                    api = AnswerAPI()
+                question = Question(
+                    type=QUIZ_TYPE_CODES.get(self.questionType_list[index], '9'),
+                    question=self.only_title_text[index],
+                    options=(self.num_option_dit or {}).get(index) or [],
+                    API=self.API_KEY)
+                api.cache_answer(question, list(answer))
+                right += 1
+            except Exception:
+                continue
+        if right or wrong:
+            print(color.green(f'提交结果回填：答对 {right} 道已写入缓存，'
+                              f'答错/未判定 {wrong} 道不写缓存'), flush=True)
 
     def save_score(self):
         # save_process(self.course_name)
@@ -1289,10 +1929,37 @@ class Quiz(Common):
         self.after_finish_question = after_finish_question
         self.driver = driver
         self.course_name = course_name
+        self.session = None          # 保存 Answer 实例，供 verify_finished 读提交结果
+
+    def verify_finished(self):
+        """测验的完成判据：**平台确认提交**优先，其次才看任务点打勾。
+
+        2026-11-19（用户 15:39 那次小测）：本类传 `require_mission=False`，因为
+        平台上的测验/考试经常不算任务点；但父类 `verify_finished()` 只认
+        `ans-job-finished`。两者矛盾——即使真的提交成功，只要平台不给测验打勾，
+        就会打印「平台未确认完成，不写学习记录」，成绩记录永远不落地。
+
+        现在的判定顺序：
+          1. 平台明确提示「成功/已提交」→ 直接认定完成；
+          2. 只做了保存（没提交）→ 明确不算完成；
+          3. 点了提交但平台没给提示 → 回落到父类的任务点判定（保守，不假完成）。
+        """
+        state = getattr(getattr(self, 'session', None), 'submit_state', '')
+        if state == 'submitted':
+            print(color.green('平台已确认提交成功（不再要求任务点打勾）'), flush=True)
+            return True
+        if state == 'saved':
+            print(color.yellow('本次只保存未提交，不记为完成'), flush=True)
+            return False
+        try:
+            return bool(super().verify_finished())
+        except Exception:
+            return False
+
     def start(self):
         try:
-            Answer(self.driver, self.iframe, self.course_name, self.API, self.choice,
-                   self.after_finish_question, frame_selector=self.IFRAME_SELECTOR)
+            self.session = Answer(self.driver, self.iframe, self.course_name, self.API, self.choice,
+                                  self.after_finish_question, frame_selector=self.IFRAME_SELECTOR)
         except Exception as e:
             error_msg = traceback.format_exc()
             send_error(

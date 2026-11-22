@@ -174,6 +174,17 @@ class LogExportDialog(ctk.CTkToplevel):
         warnings = result.get('warnings') or []
         self.status.configure(text='已生成：%s（%.2f MB，%d 个条目）' % (path, size_mb, count),
                               text_color=p['accent'])
+        try:
+            from core.notifier import Notifier, format_message
+            short_name = str(path).replace('\\', '/').split('/')[-1]
+            Notifier.instance().notify(
+                'export_done',
+                format_message('日志导出完成 · %.2f MB / %d个条目' % (size_mb, count),
+                               ['日期：%s' % result.get('day', ''),
+                                '文件：%s' % short_name[:40]]),
+                title='日志导出完成')
+        except Exception:
+            pass
         lines = ['已导出为一个单独文件：', path, '',
                  '大小：%.2f MB' % size_mb, '包内条目：%d 个' % count,
                  '包内 00_FULL_LOG_%s.txt 是所有文字日志的合并版。' % result.get('day', '')]

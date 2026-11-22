@@ -93,6 +93,11 @@ class ApiQuota:
         while True:
             if self.allow(key, tag):
                 return True
+            # V5.1 消除无意义死等：额度被显式配成 0 时，无论等多少个时间窗
+            # 都不可能放行，立即拒绝而不是白等 max_wait（默认 90 秒）。
+            if self.max_per_minute <= 0:
+                self._warn('minute0', '每分钟联网上限为 0，直接拒绝，不等待时间窗')
+                return False
             if not wait or self.stopped or self.last_reason != 'minute':
                 return False
             if time.time() >= deadline:

@@ -17,7 +17,8 @@ sign_txt = None
 
 def bootstrap( phone: str = None, password: str = None):
     """获取可用会话: 优先用本地保存的信息, 否则提示输入"""
-    client = login_mod.restore_client(sign_text=sign_txt)
+    # P0：恢复会话前带上本次选择的账号，防止复用上一个账号的登录态
+    client = login_mod.restore_client(sign_text=sign_txt, expected_phone=phone)
     if client is not None:
         storage.log("已使用本地保存的登录信息(%s), 无需重新输入账号密码"
                     % (client.name or client.uid),sign_text=sign_txt)

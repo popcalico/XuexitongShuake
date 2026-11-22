@@ -29,6 +29,9 @@ MAX_BYTES = 8 * 1024 * 1024
 _lock = threading.Lock()
 _ready = False
 _path = None
+# 已创建过的日志目录。GUI 每输出一行就写一次日志，逐行 os.makedirs 是
+# 「越跑越卡」的固定开销（诊断 2026-11-12 P1）；目录只需建一次。
+_ensured_dirs = set()
 
 
 def log_path() -> str:
@@ -38,9 +41,17 @@ def log_path() -> str:
     return _path
 
 
+def _ensure_dir(folder: str) -> None:
+    if not folder or folder in _ensured_dirs:
+        return
+    os.makedirs(folder, exist_ok=True)
+    _ensured_dirs.add(folder)
+
+
 def _rotate(path: str) -> None:
     try:
-        if os.path.exists(path) and os.path.getsize(path) > MAX_BYTES:
+        # 文件不存在时 getsize 抛 OSError，等价于原来的 exists 判断，少一次 stat
+        if os.path.getsize(path) > MAX_BYTES:
             os.replace(path, path + '.1')
     except OSError:
         pass
@@ -48,21 +59,17 @@ def _rotate(path: str) -> None:
 
 def _write(line: str) -> None:
     path = log_path()
+    folder = os.path.dirname(path)
     try:
-        folder = os.path.dirname(path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
+        _ensure_dir(folder)
         with _lock:
-            # 运行中也可能涨到上限（启动后长时间跑），所以每写一行都顺手检查一次
-            try:
-                if os.path.exists(path) and os.path.getsize(path) > MAX_BYTES:
-                    os.replace(path, path + '.1')
-            except OSError:
-                pass
+            # 轮转仍逐行检查（运行中随时可能涨到上限），但只剩一次 stat
+            _rotate(path)
             with open(path, 'a', encoding='utf-8') as f:
                 f.write(line + '\n')
     except (OSError, ValueError):
-        pass
+        # 目录被外部清掉时，下次写入会重建
+        _ensured_dirs.discard(folder)
 
 
 def _stamp() -> str:

@@ -16,11 +16,33 @@ import uuid
 
 from core import paths
 
+# 本地凭据保护（2026-11-16 任务03）：敏感字段只以引用形式落盘 JSON。
+# 每条记录的 name 带作用域/账号 id，保证账号隔离。
+try:
+    from core import credential_store as secrets
+except Exception:      # 极端情况下模块缺失也不能让配置完全不可用
+    secrets = None
+
+SECRET_REF_PREFIX = 'secret_ref:'
+
+# (作用域, 字段名) -> 凭据名模板。global 字段不带账号；account 字段带 id。
+_SECRET_FIELDS = [
+    ('global', 'API', 'global.API'),          # AI API Key
+    ('global', 'meow_url', 'global.meow_url'),  # MeoW 设备 URL（含 token）
+    ('account', 'password', 'account.{id}.password'),
+    ('account', 'phone_number', 'account.{id}.phone'),
+]
+
 
 GLOBAL_KEYS = {
     'browser', 'driver_path', 'API', 'font_type', 'font_size', 'user_notice',
     'max_concurrency', 'timer_active', 'timer_start', 'timer_end',
     'file_name', 'current_account',
+    # MeoW 推送（2026-11-06）：设备 URL 属于凭据，绝不写进 example/仓库
+    'meow_enabled', 'meow_url', 'meow_category_enabled', 'meow_events',
+    # OpenAI 兼容 AI 接口（2026-11-10）：地址/模型/超时不是凭据，随全局配置走
+    'ai_base_url', 'ai_model', 'ai_vision_model', 'ai_timeout',
+    'browser_disable_web_security',
 }
 
 ACCOUNT_KEYS = {
@@ -28,6 +50,15 @@ ACCOUNT_KEYS = {
     'after_finish_question', 'video_title_choice', 'discussion_choice',
     'homework', 'task_type', 'speed', 'pass_face', 'pass_vido',
     'lock_screen', 'multi_device', 'radio_var',
+    # 无法处理的题策略 / 讨论范围与作答方式（2026-11-06）
+    'unanswerable_policy', 'discussion_scope', 'discussion_copy_reply',
+    # 课程考试（2026-11-08）。交卷开关默认关闭，必须用户显式开启才算授权。
+    'exam_answer_mode', 'exam_auto_submit', 'exam_submit_ratio',
+    'exam_revoke_seconds', 'exam_min_remain_minutes', 'exam_max_questions',
+    'exam_paper_total',  # 整卷题数(0=自动探测答题卡)；交卷分母必须用它，禁止用本轮遍历数
+    # 2026-11-19 从上游 26.11.18 移植：复习模式 / 复习遍数 / 自动问卷。
+    # 这三个键必须与 runtime.DEFAULTS 同名，否则子进程读不到（配置快照按名字装载）。
+    'review', 'review_times', 'vote_enabled',
 }
 
 DEFAULT_GLOBAL = {
@@ -43,6 +74,17 @@ DEFAULT_GLOBAL = {
     'timer_end': '03:00:00',
     'file_name': ['python', 'main.py'],
     'current_account': '',
+    # 通知默认关闭；设备 URL 留空由用户在本机填写（不要写进任何模板文件）
+    'meow_enabled': 0,
+    'meow_url': '',
+    'meow_category_enabled': 1,
+    'meow_events': {},
+    # OpenAI 兼容 AI 接口：默认仍指向 DeepSeek，老配置不填新字段时行为不变
+    'ai_base_url': 'https://api.deepseek.com',
+    'ai_model': 'deepseek-v4-flash',
+    'ai_vision_model': '',
+    'ai_timeout': 0,
+    'browser_disable_web_security': 0,
 }
 
 DEFAULT_ACCOUNT = {
@@ -63,6 +105,23 @@ DEFAULT_ACCOUNT = {
     'lock_screen': 0,
     'multi_device': 0,
     'radio_var': 1,
+    # 默认：AI 尽力完成（处理不了自动降级截图跳过）、任务点内全部讨论、直接 DeepSeek 不抄回复
+    'unanswerable_policy': 'AI 尽力完成',
+    'discussion_scope': '任务点内全部讨论',
+    'discussion_copy_reply': 0,
+    # 考试：只答不交卷；阈值沿用「搜到/点到的题」比例，不是正确率
+    'exam_answer_mode': '题库优先+AI兜底',
+    'exam_auto_submit': 0,
+    'exam_submit_ratio': 100,
+    'exam_revoke_seconds': 15,
+    'exam_min_remain_minutes': 10,
+    'exam_max_questions': 200,
+    'exam_paper_total': 0,
+    # 2026-11-19：复习模式默认关闭（不改变老用户行为）；遍数默认 1；
+    # 问卷默认自动作答（问卷通常不计分，但漏做会一直卡在「未识别页」）。
+    'review': 0,
+    'review_times': 1,
+    'vote_enabled': 1,
 }
 
 MAX_CONCURRENCY_LIMIT = 5
@@ -129,6 +188,37 @@ class ConfigManager:
         if not isinstance(data, dict) or 'accounts' not in data:
             data = self._migrate_legacy()
 
+        # 凭据迁移（2026-11-16 任务03）：旧 JSON 里的明文敏感字段
+        # 先备份原文件 -> 加密入库 -> 回读验证 -> 换成引用。
+        # 注意顺序：先迁移（把明文换 ref 并落盘），最后统一 deserialize 还原内存明文；
+        # 否则「还原后的明文」会被 migrate 再次当成明文写回 ref，覆盖内存值。
+        if secrets and os.path.exists(self.accounts_path):
+            ok, changed, note = self._migrate_secrets(data)
+            # 2026-11-19 性能修复：只在「确实迁到了明文」时才备份 + 重新加密落盘。
+            # 旧实现只要 ok 就无条件 _write_json(_serialize_for_disk())，而后者会
+            # 把所有敏感字段重新 DPAPI 加密 + 写盘 + 调 icacls —— 于是每次启动都
+            # 白做一轮（多次黑窗 + 明显启动延迟），哪怕配置压根没变。
+            if ok and changed:
+                try:
+                    import shutil
+                    shutil.copy2(self.accounts_path, self.accounts_path + '.precred')
+                except OSError:
+                    pass
+                try:
+                    _write_json(self.accounts_path, self._serialize_for_disk(data))
+                except Exception:
+                    pass
+            elif not ok:
+                print('[凭据] 旧配置迁移未完成（%s），保留原始配置' % note)
+        elif secrets and data:
+            # 新建/legacy 迁移出来的结构：直接把明文入库
+            ok, _changed, _ = self._migrate_secrets(data)
+            if not ok:
+                print('[凭据] 新配置凭据入库失败，拒绝继续使用明文')
+        # 最后统一把 ref 还原成内存明文，供 GUI / 子进程使用
+        if secrets:
+            self._deserialize_from_disk(data)
+
         data.setdefault('version', 2)
         data.setdefault('global', {})
         data.setdefault('accounts', [])
@@ -153,15 +243,101 @@ class ConfigManager:
             self.save_accounts(data)
         return data
 
+    # ================= 凭据保护（2026-11-16 任务03） =================
+    @staticmethod
+    def _secret_name(scope, field, tmpl, acc):
+        return tmpl.format(id=acc.get('id', '')) if scope == 'account' else tmpl
+
+    def _serialize_for_disk(self, data):
+        """返回落盘副本：敏感字段加密入库，JSON 里只留 `secret_ref:` 引用。
+
+        原 data（内存态）保持明文不变，供 GUI / 子进程正常使用。
+        凭据库失败时抛 CredentialError —— 上层 save_accounts 会据此拒绝写盘，
+        绝不把明文落进 JSON。
+        """
+        import copy
+        out = copy.deepcopy(data)
+        g = out.get('global', {})
+        for scope, field, tmpl in _SECRET_FIELDS:
+            bucket = g if scope == 'global' else None
+            targets = []
+            if scope == 'global':
+                targets = [(g, bucket)]
+            else:
+                targets = [(acc, acc) for acc in out.get('accounts', [])]
+            for obj, _ in targets:
+                val = obj.get(field, '')
+                if val is None or val == '' or str(val).startswith(SECRET_REF_PREFIX):
+                    continue
+                name = self._secret_name(scope, field, tmpl, obj)
+                secrets.save_secret(name, val)
+                obj[field] = SECRET_REF_PREFIX + name
+        return out
+
+    def _deserialize_from_disk(self, data):
+        """把 JSON 里的 `secret_ref:` 还原为明文（内存态），失败保留空占位。"""
+        g = data.get('global', {})
+        for scope, field, tmpl in _SECRET_FIELDS:
+            if scope == 'global':
+                targets = [g]
+            else:
+                targets = list(data.get('accounts', []))
+            for obj in targets:
+                val = obj.get(field, '')
+                if not (isinstance(val, str) and val.startswith(SECRET_REF_PREFIX)):
+                    continue
+                name = val[len(SECRET_REF_PREFIX):]
+                try:
+                    obj[field] = secrets.load_secret(name, '') if secrets else ''
+                except Exception:
+                    # 凭据丢失/损坏：保留引用占位，上层会给出空值，但绝不读明文
+                    obj[field] = ''
+
+    def _migrate_secrets(self, data):
+        """旧配置里残留明文敏感字段时：加密入库 -> 回读验证 -> 换引用。
+
+        返回 `(ok, changed, note)`：
+        * `ok=False` 表示迁移失败（调用方保留原 JSON 与内存明文，绝不写半截）；
+        * `changed=True` 才表示**真的动过数据**，调用方据此决定是否重新落盘。
+          这个标志是 2026-11-19 加的性能门：没有它，每次启动都会把所有凭据
+          重新加密一遍（多次黑窗 + 启动变慢），即使配置完全没变化。
+
+        全部成功才继续；任何一步失败都保留原 JSON 与内存明文（由调用方决定是否阻断）。
+        """
+        if secrets is None:
+            return False, False, '凭据模块不可用'
+        changed = False
+        g = data.get('global', {})
+        for scope, field, tmpl in _SECRET_FIELDS:
+            targets = [g] if scope == 'global' else list(data.get('accounts', []))
+            for obj in targets:
+                val = obj.get(field, '')
+                if not val or (isinstance(val, str) and val.startswith(SECRET_REF_PREFIX)):
+                    continue
+                name = self._secret_name(scope, field, tmpl, obj)
+                try:
+                    secrets.save_secret(name, val)          # 加密写入
+                    back = secrets.load_secret(name, None)  # 回读验证
+                    if back != val:
+                        return False, changed, '%s 回读校验失败' % name
+                except Exception as e:
+                    return False, changed, '%s 加密失败：%s' % (name, e)
+                obj[field] = SECRET_REF_PREFIX + name
+                changed = True
+        return True, changed, ('已迁移' if changed else '无需迁移')
+
     def save_accounts(self, data: dict = None) -> bool:
         data = data or self._data
         if not data:
             return False
         try:
-            _write_json(self.accounts_path, data)
-            self._data = data
+            # 敏感字段加密入库，JSON 只写引用；失败拒绝写盘（不降级明文）
+            disk = self._serialize_for_disk(data) if secrets else data
+            _write_json(self.accounts_path, disk)
+            self._data = data     # 内存态保持明文
             return True
-        except OSError:
+        except Exception as e:
+            print('[凭据] 配置保存失败（未写明文）：%s' % e)
             return False
 
     def _blank_account(self, alias='') -> dict:
@@ -179,6 +355,10 @@ class ConfigManager:
             if k in legacy:
                 g[k] = legacy[k]
         acc = self._blank_account(legacy.get('phone_number') or '账号1')
+        # 子进程 HOME 里的 account_info.json 带着 runner 写入的真实 account_id，
+        # 迁移时沿用它，避免「日志 id=acc_xxx 但 HOME=acc_yyy」这种看着像串号的假象
+        if legacy.get('account_id'):
+            acc['id'] = str(legacy['account_id'])
         for k in ACCOUNT_KEYS:
             if k in legacy:
                 acc[k] = legacy[k]
@@ -367,6 +547,9 @@ class ConfigManager:
         flat.pop('id', None)
         flat.pop('alias', None)
         flat['account_id'] = account_id
+        # 让子进程知道一共开了几个账号：单账号时浏览器已有登录态就可以直接复用，
+        # 不必清 Cookie 重新登录（多账号才需要严格防串号）
+        flat['account_count'] = len(data['accounts'])
         # 多账号模式下多端学习会叠乘浏览器数量，强制关闭
         if len(data['accounts']) > 1:
             flat['multi_device'] = 0

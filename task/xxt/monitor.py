@@ -91,15 +91,45 @@ def monitor(client: XXTClient, interval: Optional[int] = None,
     started = time.time()
     storage.log("签到检测已启动: 每 %d 秒检查一次 (并发 %d, 最长 %d 分钟, Ctrl+C 退出)"
                 % (base_interval, workers, max_runtime // 60),sign_text=sign_text)
+    try:
+        from core.notifier import Notifier, format_message
+        Notifier.instance().notify(
+            'sign_start',
+            format_message('签到已启动 · %d秒间隔 / 上限%d秒 / 最长%d分钟'
+                           % (base_interval, max_interval, max_runtime // 60),
+                           ['空闲自动退避，到点自动停止']),
+            title='签到开始')
+    except Exception:
+        pass
     all_courses: List = []
     cycle = 0
     while True:
         if stop_event and stop_event.is_set():
             storage.log("签到检测已停止",sign_text=sign_text)
+            try:
+                from core.notifier import Notifier, format_message
+                from core.digest import elapsed_text
+                Notifier.instance().notify(
+                    'sign_stop',
+                    format_message('签到已停止 · 运行%s' % elapsed_text(time.time() - started),
+                                   ['原因：手动停止或父进程退出']),
+                    title='签到停止')
+            except Exception:
+                pass
             break
         if max_runtime and time.time() - started >= max_runtime:
             storage.log("自动签到已连续运行 %d 分钟，自动停止（避免长时间高频请求）"
                         % (max_runtime // 60),sign_text=sign_text)
+            try:
+                from core.notifier import Notifier, format_message
+                from core.digest import elapsed_text
+                Notifier.instance().notify(
+                    'sign_stop',
+                    format_message('签到自动停止 · 运行%s' % elapsed_text(time.time() - started),
+                                   ['原因：达到最长运行时间，避免高频请求']),
+                    title='签到停止')
+            except Exception:
+                pass
             break
         cycle += 1
         if not all_courses or cycle % course_refresh_cycles == 1:

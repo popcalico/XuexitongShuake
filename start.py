@@ -26,6 +26,8 @@ import logging
 from gui import theme
 from core import paths
 from core import applog
+from core import logfmt
+from core.notifier import Notifier
 from core.runner import Runner
 from gui.sponsor_panel import SponsorPanel
 from core.config_manager import ConfigManager
@@ -60,6 +62,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler(paths.root_data('输出记录.log'), encoding='utf-8')]
 )
+# fontTools 每次字体解密都会 INFO 级 dump 十几张字体表，httpx 每次 AI 请求也刷一行；
+# 长时间运行时这些噪音持续写盘、日志迅速膨胀，是「越用越慢」的可见来源之一
+# （2026-11-14 真机日志 gui.log 里几百行 `Dumping 'xxx' table...`）。
+for _noisy in ('fontTools', 'fontTools.ttLib', 'httpx', 'httpcore'):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 class Start:
@@ -71,8 +78,17 @@ class Start:
         self._alias_map = {}
         self.thread = None
         self.config = ConfigManager()
+        try:
+            Notifier.instance().configure(self.config.load_account())
+        except Exception:
+            pass
+        # P1：GUI 日志批量刷新队列（必须在 Runner 之前建，回调会用到）
+        import queue as _queue
+        self._log_queue = _queue.Queue(maxsize=self.LOG_QUEUE_MAX)
+        self._log_closed = False
         self.runner = Runner(self.config, self._on_account_output,
                              self._on_account_finish, max_concurrency=2)
+        self._exam_mode = False
         self.timer_active = False
 
         self.dynamic_rows = []
@@ -116,8 +132,14 @@ class Start:
         self.error_frame = ctk.CTkFrame(self.root, fg_color=self.frame_fg_color, corner_radius=0)
         self.money_frame = ctk.CTkFrame(self.root, fg_color=self.frame_fg_color, corner_radius=0)
         self.root.resizable(True, True)
-        # 允许自由缩放，但给个下限，避免日志区和按钮挤成一团
-        self.root.minsize(860, 560)
+        # 允许自由缩放，但给个下限，避免日志区和按钮挤成一团。
+        # 下限必须跟着屏幕走：写死 860x560 在 125%/150% 缩放的笔记本上
+        # 已经接近整屏宽，用户会觉得「窗口根本拉不动」（2026-11-21 反馈）。
+        _sw = self.root.winfo_screenwidth()
+        _sh = self.root.winfo_screenheight()
+        # 下限要明显小于「双列切换阈值(900)」，否则用户永远拉不到单列布局
+        self.root.minsize(max(680, min(820, int(_sw * 0.50))),
+                          max(460, min(600, int(_sh * 0.50))))
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(1, weight=1)
         self.root.iconbitmap(paths.asset('img', 'xuexitong1 .ico'))
@@ -125,6 +147,8 @@ class Start:
         # 关闭窗口 / 界面回调异常都记进程序日志，方便事后追溯
         self.root.protocol('WM_DELETE_WINDOW', self._on_window_close)
         self.root.report_callback_exception = self._on_ui_exception
+        # P1：启动 GUI 日志批量刷新回调（每 100ms 一批，不再逐行 after）
+        self.root.after(self.LOG_FLUSH_MS, self._flush_log_queue)
         applog.info('窗口初始化完成：title=%s' % self.root.title())
         # 初始化子模块
         self._updater = UpdateChecker(self.root, self.config.get_version, self._get_colors)
@@ -213,12 +237,12 @@ class Start:
         self.start_button = ctk.CTkButton(self.main_frame, text="▶ 开始学习", height=40, border_spacing=10,
                                           fg_color=self.button_color,
                                           command=self.start, font=self.font, hover_color=self.button_hover_color)
-        self.start_button.grid(row=0, column=0, padx=5, pady=5)
+        self.start_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
         self.auto_sign = ctk.CTkButton(self.main_frame, text="自动签到", height=40, border_spacing=10,
                                        fg_color=self.button_color,
                                        command=self.start_sign, font=self.font,
                                        hover_color=self.button_hover_color)
-        self.auto_sign.grid(row=0, column=1, padx=5, pady=5)
+        self.auto_sign.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         self.close_button = ctk.CTkButton(self.main_frame, text="■ 结束学习", height=40, border_spacing=10,
                                           fg_color=self.button_color, hover_color=self.button_hover_color,
                                           command=self.close, font=self.font)
@@ -226,7 +250,7 @@ class Start:
                                            fg_color=self.button_color,
                                            command=self.check_update, font=self.font,
                                            hover_color=self.button_hover_color)
-        self.update_button.grid(row=0, column=2, padx=5, pady=5)
+        self.update_button.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
         # 一键导出：把某一天的全部日志/截图/记录/脱敏配置收进一个 zip 单文件
         self.export_log_button = ctk.CTkButton(self.main_frame, text="⇩ 导出完整日志",
                                                height=40, border_spacing=10,
@@ -234,13 +258,26 @@ class Start:
                                                command=lambda: open_export_dialog(self.root),
                                                font=self.font,
                                                hover_color=self.button_hover_color)
-        self.export_log_button.grid(row=0, column=3, padx=5, pady=5)
+        self.export_log_button.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
+        # 独立「开始考试」：不进课程循环，登录后由用户自己选考试，
+        # 程序只读识别页面链；答完停在页面由用户手动提交，绝不交卷
+        self.start_exam_button = ctk.CTkButton(
+            self.main_frame, text="▶ 开始考试", height=40, border_spacing=10,
+            fg_color=self.button_color, command=self.start_exam, font=self.font,
+            hover_color=self.button_hover_color)
+        self.start_exam_button.grid(row=0, column=4, padx=5, pady=5, sticky="ew")
+        # 工具栏按钮：按「当前可见的那几个」自动均分整行宽度。
+        # 旧写法把列号写死在创建时，运行中隐藏「开始学习/开始考试」后
+        # 右侧会空出一整列（用户截图里按钮之间的大缝就是这么来的）。
+        self._toolbar_buttons = [self.start_button, self.start_exam_button,
+                                 self.auto_sign, self.update_button,
+                                 self.export_log_button, self.close_button]
         self.text_box_frame= ctk.CTkFrame(self.main_frame, fg_color=self.frame_fg_color, corner_radius=0,width=450)
-        self.text_box_frame.grid(row=1, column=0, columnspan=4, padx=10, pady=10, sticky=tk.W + tk.E + tk.N + tk.S)
+        self.text_box_frame.grid(row=1, column=0, columnspan=5, padx=10, pady=10, sticky=tk.W + tk.E + tk.N + tk.S)
         self.text_box_frame.columnconfigure(0, weight=1)
         self.text_box_frame.rowconfigure(1, weight=1)
         # 让内容区填满窗口，避免右侧与底部留出大片空白
-        for _col in (0, 1, 2, 3):
+        for _col in (0, 1, 2, 3, 4):
             self.main_frame.columnconfigure(_col, weight=1)
         self.main_frame.rowconfigure(1, weight=1)
 
@@ -268,15 +305,18 @@ class Start:
         self.log_host.rowconfigure(0, weight=1)
 
         self.text_box_map = {}
+        self._log_tags = set()          # 已配置过前景色的日志 tag，避免每行重复 tag_config
         self._log_index = {}
         self.text_box = self._ensure_log_box('__default__')
         self.text_box.grid(row=0, column=0, sticky="nsew")
 
         self.hint_txt='WELCOME TO 课程学习助手 ！！！\n请先进入设置页面填写信息！！！'
+        # 空状态提示：居中显示、用次要文字色。
+        # 旧版是红色一行挂在日志框最上面，下面整片空白看着像「界面坏了」。
         self.hint_label=ctk.CTkLabel(self.log_host,text=self.hint_txt,font=self.font,
-                                     fg_color=self.surface_color,
-                                     width=300,text_color=self.danger_color)
-        self.hint_label.grid(row=0,column=0,sticky=tk.N,pady=5,padx=5)
+                                     fg_color='transparent', justify='center',
+                                     text_color=self.text_muted_color)
+        self.hint_label.grid(row=0,column=0,sticky='',pady=0,padx=5)
         self.frame_name_list = [self.main_frame, self.set_frame, self.help_frame, self.vido_frame,
                                 self.score_frame, self.question_bank_frame, self.error_frame, self.money_frame,
                                 self.open_frame, self.navigation_frame, self.label_frame,self.text_box_frame]
@@ -317,7 +357,10 @@ class Start:
                                         fg_color=self.surface_color, border_width=1,
                                         border_color=self.border_color)
         self.vido_text.configure(state=tk.DISABLED)
-        self.vido_text.grid(row=2, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W + tk.E + tk.N + tk.S)
+        self.vido_text.grid(row=2, column=0, columnspan=3, padx=10, pady=(5, 10),
+                            sticky=tk.W + tk.E + tk.N + tk.S)
+        self.vido_frame.columnconfigure(0, weight=1)
+        self.vido_frame.rowconfigure(2, weight=1)
 
         # ---------------- 成绩日志 ----------------
         self.course_score_entry = ctk.CTkComboBox(self.score_frame, dropdown_font=self.font, font=self.font, values=[],
@@ -337,12 +380,15 @@ class Start:
                                             hover_color=self.danger_hover_color,
                                             font=self.font)
         self.delete_button2.grid(row=0, column=2, padx=1, pady=5)
-        self.score_frame.rowconfigure(0, weight=1)
+        # 权重必须给「文本框所在的行」，旧代码加在第 0 行（下拉框），
+        # 于是窗口拉高只会把下拉框那一行拉高，文本框纹丝不动
+        self.score_frame.columnconfigure(0, weight=1)
+        self.score_frame.rowconfigure(1, weight=1)
         self.score_txt = ctk.CTkTextbox(self.score_frame, height=self._box_height(60), width=435, font=self.font,
                                         fg_color=self.surface_color, border_width=1,
                                         border_color=self.border_color)
         self.score_txt.configure(state=tk.DISABLED)
-        self.score_txt.grid(row=1, column=0, columnspan=3, padx=10, pady=5,
+        self.score_txt.grid(row=1, column=0, columnspan=3, padx=10, pady=(5, 10),
                             sticky=tk.W + tk.E + tk.N + tk.S)
         self.dit = {'学习': [self.course_vido_entry, '学习记录', self.vido_text, self.vido_frame],
                     '成绩': [self.course_score_entry, '测试成绩', self.score_txt, self.score_frame]}
@@ -352,7 +398,10 @@ class Start:
                                         font=self.font, fg_color=self.surface_color, border_width=1,
                                         border_color=self.border_color)
         self.tiku_text.configure(state=tk.DISABLED)
-        self.tiku_text.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky=tk.W + tk.E + tk.N + tk.S)
+        self.tiku_text.grid(row=1, column=0, columnspan=2, padx=10, pady=5,
+                            sticky=tk.W + tk.E + tk.N + tk.S)
+        self.question_bank_frame.columnconfigure(0, weight=1)
+        self.question_bank_frame.rowconfigure(1, weight=1)
         self.delete_tiku_button = ctk.CTkButton(
             self.question_bank_frame, text="删除所有缓存题目", command=self.delete_huancun,
             fg_color=self.danger_color, hover_color=self.danger_hover_color, corner_radius=16, height=36
@@ -365,7 +414,11 @@ class Start:
         self.style.configure('TLabelframe.Label', background=self.frame_fg_color, font=self.font)
         self.style.configure('TLabel', background=self.frame_fg_color)
         self.account_info = self.config.load_account()
-        # 设置项较多，放进可滚动容器，避免小屏下“保存设置”被窗口底部截断
+        # 设置项较多，放进可滚动容器；「保存设置」单独固定在底部，
+        # 否则内容一长就得滚到底才能保存（用户反馈「找不到保存」）
+        self.settings_footer = ctk.CTkFrame(self.set_frame, fg_color=self.frame_fg_color,
+                                            corner_radius=0)
+        self.settings_footer.pack(side='bottom', fill='x', padx=12, pady=(6, 10))
         self.settings_scroll = ctk.CTkScrollableFrame(
             self.set_frame, fg_color=self.frame_fg_color, corner_radius=0,
             scrollbar_button_color=self.border_color,
@@ -381,7 +434,8 @@ class Start:
             get_theme=self._get_theme,
             show_money=self.show_money,
             root=self.root,
-            _timer=self._timer
+            _timer=self._timer,
+            footer=self.settings_footer
         )
 
         self.combobox_lst = [
@@ -389,8 +443,9 @@ class Start:
         ]
         self.combobox_lst.extend(self.settings_panel.comboboxes)
         self.check_switch = list(self.settings_panel.switches)
-        self.button_name_list1 = [self.start_button, self.auto_sign, self.close_button, self.update_button,
-                                  self.export_log_button,
+        self.button_name_list1 = [self.start_button, self.start_exam_button, self.auto_sign,
+                                    self.close_button, self.update_button,
+                                    self.export_log_button,
                                   self.find_button1, self.find_button2, self.delete_button1, self.delete_button2]
         self.button_name_list1.extend(self.settings_panel.buttons)
 
@@ -399,7 +454,9 @@ class Start:
         self.help_txt = ctk.CTkTextbox(self.help_frame, height=self._box_height(80), width=500, font=self.font,
                                        fg_color=self.surface_color, border_width=1,
                                        border_color=self.border_color)
-        self.help_txt.grid(pady=(5,20))
+        self.help_txt.grid(row=0, column=0, padx=10, pady=(10, 16), sticky="nsew")
+        self.help_frame.columnconfigure(0, weight=1)
+        self.help_frame.rowconfigure(0, weight=1)
         self.help_txt.insert(tk.END, self.text)
         self.help_txt.configure(state=tk.DISABLED)
 
@@ -408,7 +465,9 @@ class Start:
                                          font=self.font, fg_color=self.surface_color, border_width=1,
                                          border_color=self.border_color)
         self.error_text.configure(state=tk.DISABLED)
-        self.error_text.grid(pady=(5,20),row=0,column=0)
+        self.error_text.grid(row=0, column=0, padx=10, pady=(10, 16), sticky="nsew")
+        self.error_frame.columnconfigure(0, weight=1)
+        self.error_frame.rowconfigure(0, weight=1)
 
         # ---------------- 赞助页面 ----------------
         self.sponsor_panel = SponsorPanel(self.money_frame,self._get_font,self._get_colors,self.root)
@@ -429,17 +488,53 @@ class Start:
                                  f"请勿关闭此窗口，否则定时学习将无法正常开启")
         self.hint_label.configure(text=self.hint_txt)
 
-        # 依据内容自适应尺寸并居中显示（原先写死在屏幕右侧 +1050+20）
+        # 窗口尺寸：优先沿用上次关闭时的大小（用户拉过就记住），
+        # 否则按「屏幕的 3/4」开一个像样的窗口 —— 旧实现用控件最小需求当尺寸，
+        # 窗口一开就是刚好装下内容，看着挤，用户想拉大又会被各种固定宽度卡住。
         self.root.update_idletasks()
         scale = ctk.ScalingTracker.get_window_scaling(self.root) or 1.0
-        win_w = self.root.winfo_reqwidth()   # 逻辑尺寸，CTk 的 geometry 内部会乘以缩放比
-        win_h = self.root.winfo_reqheight()
+        scr_w = self.root.winfo_screenwidth() / scale
+        scr_h = self.root.winfo_screenheight() / scale
+        saved = self._load_window_geometry()
+        if saved:
+            win_w, win_h = saved
+        else:
+            win_w = max(self.root.winfo_reqwidth(), int(scr_w * 0.74))
+            win_h = max(self.root.winfo_reqheight(), int(scr_h * 0.80))
+        # 永远不许超出屏幕（含任务栏），否则标题栏跑到屏幕外就再也拖不动了
+        win_w = int(min(win_w, scr_w - 16))
+        win_h = int(min(win_h, scr_h - 56))
         pos_x = max(0, (self.root.winfo_screenwidth() - int(win_w * scale)) // 2)
         pos_y = max(0, (self.root.winfo_screenheight() - int(win_h * scale)) // 3)
         self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        self.root.resizable(True, True)
+        self._sync_toolbar()
+        applog.info('窗口尺寸：%dx%d（屏幕 %.0fx%.0f 逻辑像素，scale=%.2f）'
+                    % (win_w, win_h, scr_w, scr_h, scale))
 
 
     # ========== 委托方法（供子模块回调） ==========
+
+    def _sync_toolbar(self):
+        """把「当前可见」的工具栏按钮从左到右均分整行，不留空列。
+
+        旧写法在创建时就把列号写死（0~4），运行中隐藏「开始学习/开始考试」
+        后右侧会空一整列，看起来就是按钮之间一条大缝、整体不齐。
+        """
+        try:
+            visible = [b for b in self._toolbar_buttons
+                       if b.winfo_manager() == 'grid']
+            for index, button in enumerate(visible):
+                button.grid_configure(row=0, column=index, padx=5,
+                                      pady=10 if button is self.start_button else 5,
+                                      sticky='ew')
+            for col in range(6):
+                self.main_frame.columnconfigure(
+                    col, weight=1 if col < len(visible) else 0)
+            # 日志区的跨列数跟着可见按钮走，否则右侧会留一条空白带
+            self.text_box_frame.grid_configure(columnspan=max(1, len(visible)))
+        except Exception:
+            applog.exception('工具栏重排失败')
 
     def _box_height(self, extra: int = 0) -> int:
         """日志框高度按屏幕高度自适应，避免窗口高过屏幕被截断。
@@ -534,9 +629,37 @@ class Start:
     # ========== 更新检查（委托） ==========
 
     def check_update(self):
-        self.hint_label.grid(row=0, column=0, sticky=tk.N, pady=5, padx=5)
-        self.hint_txt+=self._updater.check()
-        self.hint_label.configure(text=self.hint_txt)
+        """异步检查更新：网络在后台线程，弹窗与文字更新回到主线程。
+
+        旧实现直接在 `after(800)` 回调里跑 `requests.get(timeout=10)`，
+        网络慢时 GUI 主线程被冻结最多 10 秒，用户感知就是「启动卡住、点不动」。
+        现在改成后台线程 + `root.after(0, ...)` 回主线程更新，启动即可交互。
+        """
+        # 只在「还没有任何日志」时才把空状态提示放回来，
+        # 否则点一次「检查更新」就会在日志上盖一层欢迎语。
+        try:
+            if not self.text_box.get('1.0', 'end-1c').strip():
+                self.hint_label.grid(row=0, column=0, sticky='', pady=0, padx=5)
+        except Exception:
+            pass
+        if getattr(self, '_update_check_running', False):
+            return
+        self._update_check_running = True
+
+        def done(text):
+            self._update_check_running = False
+            if not text:
+                return
+            try:
+                self.hint_txt += text
+                self.hint_label.configure(text=self.hint_txt)
+            except Exception:
+                pass
+
+        try:
+            self._updater.check_async(done)
+        except Exception:
+            self._update_check_running = False
 
 
     # ========== 定时学习（委托） ==========
@@ -606,8 +729,16 @@ class Start:
                 if 'ques1' not in tiku_file:
                     continue
                 tiku_file_path = os.path.join(folder_path, tiku_file)
-                data = pickle.load(open(tiku_file_path, 'rb'))['value']
-                tiku_txt += f"问题: {data['question']}\n{data['options']}\n答案为：{data['answer']}\n\n"
+                # 任务06：题库缓存用受限反序列化，绝不普通 load 来源不明的 pkl
+                try:
+                    from core import safe_pickle
+                    cache = safe_pickle.safe_load_path(tiku_file_path, {})
+                    data = cache.get('value') if isinstance(cache, dict) else None
+                except Exception:
+                    data = None
+                if not isinstance(data, dict):
+                    continue
+                tiku_txt += f"问题: {data.get('question', '')}\n{data.get('options', '')}\n答案为：{data.get('answer', '')}\n\n"
             if tiku_txt == '':
                 self.tiku_text.insert(tk.END, '暂无缓存的题目')
             self.tiku_text.insert(tk.END, tiku_txt)
@@ -665,6 +796,27 @@ class Start:
                                  font=self.font)
             self.text_box_map[account_id] = box
         return box
+
+    # 日志框行数上限：CTkTextbox 底层是 tkinter.Text，内容无限增长会让
+    # insert/see 越来越慢，这是长时间运行后界面渐进卡顿的主因。
+    LOG_MAX_LINES = 2000
+    LOG_TRIM_CHUNK = 400
+
+    def _trim_log_box(self, box):
+        """超过上限时一次删掉一批旧行（不是每行删），留出余量避免频繁触发。"""
+        try:
+            end_line = int(float(box.index('end')))
+        except Exception:
+            return
+        if end_line <= self.LOG_MAX_LINES:
+            return
+        cut = end_line - (self.LOG_MAX_LINES - self.LOG_TRIM_CHUNK)
+        if cut < 1:
+            return
+        try:
+            box.delete('1.0', '%d.0' % (cut + 1))
+        except Exception:
+            pass
 
     @staticmethod
     def _account_label(acc):
@@ -745,34 +897,137 @@ class Start:
             pass
         box.see("end")
 
+    # GUI 日志批量刷新（2026-11-16 P1）：子进程输出先入线程安全队列，
+    # 主线程每 100ms 批量取一批插入；一批只 see(END) 一次，不再每行 after(0)。
+    LOG_QUEUE_MAX = 2000          # 队列上限（只影响界面展示，磁盘日志完整保留）
+    LOG_BATCH_MAX = 500           # 每批最多插入条数
+    LOG_FLUSH_MS = 100            # 批量刷新间隔
+
+    def _log_queue_put(self, account_id, text, tag):
+        q = getattr(self, '_log_queue', None)
+        if q is None:
+            return
+        try:
+            if q.qsize() >= self.LOG_QUEUE_MAX:
+                # 背压：丢弃最旧的界面项；完整日志已同步落到磁盘，不丢数据
+                try:
+                    q.get_nowait()
+                except Exception:
+                    pass
+            q.put((account_id, text, tag))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _stamp_text(text, now=None):
+        """给界面日志每一行加 `[HH:MM:SS]` 前缀（2026-11-19）。
+
+        磁盘日志（程序日志 / 运行日志）另带完整日期，界面这里只显示时分秒，
+        既不占宽度，又能一眼看出两行之间隔了多久。
+        实现放在 core/logfmt，纯字符串处理、可单测。
+        """
+        try:
+            return logfmt.stamp(text, now=now)
+        except Exception:
+            return text
+
+    def _flush_log_queue(self):
+        """主线程批量刷新（每 100ms 调一次）；窗口关闭后自动停止。"""
+        q = getattr(self, '_log_queue', None)
+        if q is None or getattr(self, '_log_closed', False):
+            return
+        batch = []
+        try:
+            for _ in range(self.LOG_BATCH_MAX):
+                batch.append(q.get_nowait())
+        except Exception:
+            pass
+        if batch:
+            # 2026-11-19：任何异常都不得让下面的 after() 被跳过，
+            # 否则界面日志会永久停止刷新（磁盘日志还在写，用户以为程序卡死）。
+            try:
+                self._insert_log_batch(batch)
+            except Exception as e:
+                try:
+                    applog.warn('界面日志刷新异常（已忽略，继续刷新）：%s' % e)
+                except Exception:
+                    pass
+        try:
+            self.root.after(self.LOG_FLUSH_MS, self._flush_log_queue)
+        except Exception:
+            # 窗口已销毁：停掉刷新链，避免刷 TclError 日志
+            self._log_closed = True
+
+    def _insert_log_batch(self, batch):
+        """把一批日志按账号分组插入各自的日志框；每批只 see 一次。"""
+        by_account = {}
+        for aid, text, tag in batch:
+            by_account.setdefault(aid, []).append((text, tag))
+        selected = None
+        try:
+            selected = self._log_index.get(self.log_select.get())
+        except Exception:
+            selected = None
+        for aid, items in by_account.items():
+            try:
+                box = self._ensure_log_box(aid)
+                at_bottom = True
+                try:
+                    at_bottom = float(box.yview()[1]) >= 0.99
+                except Exception:
+                    pass
+                # tag 配置是**每个 Text 控件独立**的，不能用一个全局 set 记，
+                # 否则第二个账号的日志框永远不会 tag_config，彩色行全变默认色。
+                known = getattr(box, '_xxt_tags', None)
+                if known is None:
+                    known = set()
+                    try:
+                        box._xxt_tags = known
+                    except Exception:
+                        pass
+                for text, tag in items:
+                    text = self._stamp_text(text)
+                    if tag:
+                        if tag not in known:
+                            try:
+                                box.tag_config(tag, foreground=tag)
+                                known.add(tag)
+                            except Exception:
+                                pass
+                        box.insert("end", text, tag)
+                    else:
+                        box.insert("end", text)
+                self._trim_log_box(box)
+                if at_bottom and selected == aid:
+                    box.see("end")
+            except Exception:
+                continue
+
     def _on_account_output(self, account_id, text, tag):
-        # 主日志里留一份完整时间线（界面日志框关掉也不会丢）
+        # 完整日志始终同步落盘（界面批量截断不影响磁盘留档）
         if account_id == '__default__':
             applog.info(text.rstrip())
         else:
             applog.child(self._alias_map.get(account_id, account_id), text)
-
-        def insert():
-            try:
-                box = self._ensure_log_box(account_id)
-                if tag:
-                    box.tag_config(tag, foreground=tag)
-                    box.insert("end", text, tag)
-                else:
-                    box.insert("end", text)
-                if self._log_index.get(self.log_select.get()) == account_id:
-                    box.see("end")
-            except Exception:
-                pass
-        try:
-            self.root.after(0, insert)
-        except Exception:
-            pass
+        self._log_queue_put(account_id, text, tag)
 
     def _on_account_finish(self, account_id, code):
         logger.info('账号 %s 子进程结束，退出码 %s' % (account_id, code))
         applog.info('账号 %s 子进程结束，退出码 %s'
                     % (self._alias_map.get(account_id, account_id), code))
+        try:
+            from core import digest
+            from core.notifier import format_message
+            alias = self._alias_map.get(account_id, account_id)
+            d = digest.build('account_finish', account_id=account_id)
+            head = '%s 已结束 · 退出码%s · %s · %d门课/%d视频' % (
+                alias, code, d['elapsed_text'], d.get('courses_done', 0), d['videos'])
+            lines = ['未识别页：%d ｜ 错误：%d' % (d['unknown_pages'], d['errors']),
+                     '答题：%d成功 %d跳过' % (d['quiz_answered'], d['quiz_skipped'])]
+            Notifier.instance().notify('account_finish', format_message(head, lines),
+                                       title='账号结束 · %s' % alias)
+        except Exception:
+            pass
 
         def done():
             # 有账号结束 → 排队里的下一个会补上，这里把「运行中/排队」标记一起刷新
@@ -782,11 +1037,25 @@ class Start:
                 pass
             if self.runner.active_count() == 0 and self.process_condition:
                 self.process_condition = False
-                self.start_button.grid(row=0, column=0, padx=5, pady=10)
+                self.start_button.grid(row=0, column=0, padx=5, pady=10, sticky="ew")
+                self.start_exam_button.grid(row=0, column=4, padx=5, pady=5, sticky="ew")
                 self.close_button.grid_forget()
+                self._sync_toolbar()
                 self.reopen_frame()
                 try:
                     self.runtime_label.configure(text='空闲（全部结束）')
+                except Exception:
+                    pass
+                try:
+                    from core import digest
+                    from core.notifier import format_message
+                    d = digest.build('all_finish')
+                    # 只报一句事件，不做每日汇总（v3 用户明确要求）
+                    Notifier.instance().notify(
+                        'all_finish',
+                        format_message('全部账号已结束 · 共%d账号 / %d错误'
+                                       % (len(self._alias_map) or 0, d['errors'])),
+                        title='全部结束')
                 except Exception:
                     pass
         try:
@@ -807,13 +1076,58 @@ class Start:
             return False
         return True
 
+    def start_exam(self):
+        """独立考试入口：只启动当前账号，子进程走 --exam。
+
+        与「开始学习」互斥，复用同一套日志/结束/停止回调，但入口参数不同。
+        不进课程循环、不点考试入口、不交卷 —— 全部由用户在浏览器里决定。
+        """
+        if not self.check_info():
+            return
+        self.process_condition = True
+        self._exam_mode = True
+        self.start_button.grid_forget()
+        self.start_exam_button.grid_forget()
+        self.hint_label.grid_forget()
+        self.close_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        self._sync_toolbar()
+        self.fold_frame()
+
+        account_id = self.config.current_id()
+        self._alias_map = {a['id']: (a.get('alias') or a['id'])
+                           for a in self.config.list_accounts()}
+        # 独立考试只跑一个账号，避免多个浏览器窗口抢焦点
+        self.runner.set_concurrency(1)
+        self.runner.entry_args = ('--exam',)
+        applog.ui('点击「开始考试」：独立考试模式，登录后由用户自行选择考试')
+        started = self.runner.start([account_id])
+        self.refresh_log_selector()
+        self._on_account_output(
+            '__default__',
+            '已启动独立考试会话。登录完成后请自己在浏览器里选择课程与考试；\n'
+            '识别到「确认开始考试 / 答题」页面会有提示，进入答题页后自动作答。\n'
+            '答完不交卷，请你核对后手动提交；确认页的「进入考试」请自己点。\n',
+            None)
+        try:
+            Notifier.instance().configure(self.config.load_account())
+            from core import runtime
+            runtime.mark_started()
+        except Exception:
+            pass
+        self._tick_runtime_status()
+
     def start(self):
         if not self.check_info():
             return
         self.process_condition = True
+        self._exam_mode = False
+        # 上次若跑过独立考试，恢复成普通学习入口
+        self.runner.entry_args = ('--core',)
         self.start_button.grid_forget()
+        self.start_exam_button.grid_forget()
         self.hint_label.grid_forget()
-        self.close_button.grid(row=0, column=0, padx=5, pady=5)
+        self.close_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        self._sync_toolbar()
         self.fold_frame()
 
         accounts = [a for a in self.config.list_accounts() if a['enabled'] and a['phone']]
@@ -829,22 +1143,100 @@ class Start:
                                 '已启动 %d 个账号，并发上限 %d\n'
                                 % (started, self.runner.max_concurrency), None)
         logger.info('启动 %d 个账号，并发上限 %d' % (started, self.runner.max_concurrency))
+        # 设置页可能刚改过通知配置，重新读一次；「开始学习」不再推送（v3）
+        try:
+            Notifier.instance().configure(self.config.load_account())
+            from core import runtime
+            runtime.mark_started()
+        except Exception:
+            pass
+        # P1：启动静默等待看门狗（只读进展缓存，绝不并发操作 WebDriver）
+        try:
+            from core import silent_watchdog
+            silent_watchdog.start()
+        except Exception:
+            pass
         self._tick_runtime_status()
 
     def close(self):
         applog.ui('点击「结束学习」')
+        try:
+            from core import digest
+            from core.notifier import format_message
+            d = digest.build('stop')
+            head = '已手动结束 · 运行%d账号 / %s / 完成%d门课 / %d错误' % (
+                self.runner.active_count(), d['elapsed_text'],
+                d.get('courses_done', 0), d['errors'])
+            lines = ['当日视频：%d ｜ 未识别页：%d' % (d['videos'], d['unknown_pages'])]
+            Notifier.instance().notify('stop', format_message(head, lines),
+                                       title='手动结束')
+        except Exception:
+            pass
         self.process_condition = False
-        self.start_button.grid(row=0, column=0, padx=5, pady=10)
+        try:
+            from core import silent_watchdog
+            silent_watchdog.stop()
+        except Exception:
+            pass
+        self.start_button.grid(row=0, column=0, padx=5, pady=10, sticky="ew")
+        self.start_exam_button.grid(row=0, column=4, padx=5, pady=5, sticky="ew")
         self.close_button.grid_forget()
+        self._sync_toolbar()
         self.reopen_frame()
         self.runner.stop_all()
+        # 停止后恢复普通学习入口，避免下次点「开始学习」误跑考试
+        self.runner.entry_args = ('--core',)
         try:
             self.runtime_label.configure(text='空闲（已停止）')
         except Exception:
             pass
 
+    # ========== 窗口尺寸记忆 ==========
+
+    def _window_state_path(self):
+        return paths.data('ui', 'window.json')
+
+    def _load_window_geometry(self):
+        """上次关闭时的窗口宽高；没有或明显不合理就返回 None。"""
+        try:
+            with open(self._window_state_path(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            w = int(data.get('width') or 0)
+            h = int(data.get('height') or 0)
+            if w >= 640 and h >= 480:
+                return w, h
+        except Exception:
+            pass
+        return None
+
+    def _save_window_geometry(self):
+        """记住用户拉出来的大小（含最大化），下次启动直接还原。
+
+        用户反馈「无法调整大小」，一部分原因就是调整过的大小下次启动又被
+        控件最小需求顶回去；记住它，缩放手感才稳定。
+        """
+        try:
+            w = int(self.root.winfo_width())
+            h = int(self.root.winfo_height())
+            if w <= 1 or h <= 1:      # 窗口还没真正画出来
+                return
+            path = self._window_state_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({'width': w, 'height': h}, f)
+        except Exception:
+            applog.exception('保存窗口尺寸失败')
+
     def _on_window_close(self):
         applog.ui('关闭主窗口')
+        self._save_window_geometry()
+        # 先停日志刷新回调与看门狗，避免窗口销毁后 after 回调继续触发
+        self._log_closed = True
+        try:
+            from core import silent_watchdog
+            silent_watchdog.stop()
+        except Exception:
+            pass
         try:
             running = self.runner.active_count()
             if running:
@@ -995,11 +1387,13 @@ def run_selftest() -> int:
     modules = [
         'main',
         'core.paths', 'core.runner', 'core.browser', 'core.config_manager',
-        'core.log_export',
+        'core.log_export', 'core.notifier', 'core.runtime', 'core.digest',
+        'core.ai_config',
         'gui.theme', 'gui.setting_panel', 'gui.sign_window', 'gui.timer_window',
         'gui.log_export_dialog',
         'gui.tooltip', 'gui.update_checker', 'gui.sponsor_panel',
-        'task.quiz_ai', 'task.do_work', 'task.watch_vido', 'task.watch_ppt',
+        'task.quiz_ai', 'task.do_work', 'task.do_exam', 'task.exam_answer_kb',
+        'task.exam_standalone', 'task.watch_vido', 'task.watch_ppt',
         'task.watch_live', 'task.reading', 'task.play_audio', 'task.finish_dicussion',
         'task.tool.face', 'task.tool.no_secret', 'task.tool.ai_wen_da',
         'task.tool.DeepSeekAsk', 'task.tool.send_wx', 'task.tool.common',
@@ -1009,8 +1403,8 @@ def run_selftest() -> int:
         'task.xxt.courses', 'task.xxt.activity', 'task.xxt.constants',
         'selenium.webdriver.edge.webdriver', 'selenium.webdriver.chrome.webdriver',
         'customtkinter', 'PIL.Image', 'Crypto.Cipher.AES', 'numpy',
-        'fontTools.ttLib', 'openai', 'requests', 'colorama', 'tkinter',
-    ]
+          'fontTools.ttLib', 'openai', 'requests', 'colorama', 'tkinter',
+      ]
     assets = [
         ('tool', 'font_dict.txt'), ('tool', 'Help.txt'), ('tool', 'version_info'),
         ('tool', 'face_url.json'), ('tool', 'chrome-extension.crx'),
@@ -1050,6 +1444,17 @@ def run_selftest() -> int:
                 lines.append('INFO  %s detect failed :: %r' % (name, e))
     except Exception as e:
         lines.append('INFO  driver module failed :: %r' % (e,))
+    # DOM 记录（用户要求的「记住所有页面 DOM」）：自检里报告目录与今日用量，
+    # 让「配额打满/目录不可写」这类问题在自检阶段就暴露，而不是跑完才发现没记。
+    try:
+        from core import dom_dump
+        s = dom_dump.stats()
+        lines.append('INFO  dom_dump dir=%s today=%d/%d'
+                     % (s['today_dir'], s['today_count'], s['day_limit']))
+        if s['today_count'] >= s['day_limit']:
+            lines.append('WARN  dom_dump 今日快照已达上限，新的页面不会再落盘')
+    except Exception as e:
+        lines.append('INFO  dom_dump failed :: %r' % (e,))
     lines.append('')
     lines.append('RESULT=%s' % ('PASS' if ok else 'FAIL'))
     text = '\n'.join(lines) + '\n'
@@ -1082,6 +1487,13 @@ if __name__ == "__main__":
         prepare_runtime()
         import main as core
         core.run_main()
+    elif "--exam" in sys.argv:
+        # 独立「开始考试」子进程：起浏览器自动登录后，只读识别考试页面链，
+        # 不进课程循环、不代点进入考试、绝不交卷（由用户手动提交）
+        prepare_runtime()
+        applog.setup('--exam')
+        import main as core
+        core.run_exam_only()
     elif "--sign" in sys.argv:
         # 自动签到的子进程入口：一个账号一个进程，XXT_HOME 由主进程指定
         prepare_runtime()
